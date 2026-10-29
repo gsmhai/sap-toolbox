@@ -1,0 +1,76 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（用于 Release 标签，如 1.0.0）'
+        required: false
+        default: '1.0.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (Windows)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm install
+
+      - name: Build release binaries
+        run: npm run tauri build
+
+      - name: 重命名绿色免安装单 exe
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path "src-tauri\target\release" -Filter "*.exe" | Where-Object { $_.Name -notmatch '\.deps' } | Select-Object -First 1
+          if ($exe) {
+            Copy-Item $exe.FullName "SAPToolbox-v${{ inputs.version }}-portable.exe"
+            Write-Host "Portable exe: $($exe.Name)"
+          } else {
+            Write-Host "未找到 release exe"
+          }
+
+      - name: 上传绿色免安装单 exe (Artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: SAPToolbox-portable
+          path: SAPToolbox-v${{ inputs.version }}-portable.exe
+          if-no-files-found: warn
+
+      - name: 发布到 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ inputs.version }}
+          name: "SAPToolbox v${{ inputs.version }}"
+          body: |
+            手动触发的 Windows 构建产物。
+
+            - `SAPToolbox-v${{ inputs.version }}-portable.exe`：绿色免安装单文件，双击即可运行（需目标机为 Win10/11 且自带 WebView2 运行时）。
+          files: |
+            SAPToolbox-v${{ inputs.version }}-portable.exe
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
