@@ -12,11 +12,11 @@
   "app": {
     "windows": [
       {
-        "title": "SAP 工具箱 · FD33 / VA03 / VL02N",
-        "width": 1260,
-        "height": 820,
-        "minWidth": 980,
-        "minHeight": 640,
+        "title": "SAP工具箱",
+        "width": 780,
+        "height": 690,
+        "minWidth": 550,
+        "minHeight": 290,
         "resizable": true,
         "center": true
       }

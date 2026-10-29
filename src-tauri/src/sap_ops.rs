@@ -244,8 +244,11 @@ pub fn change_out_bound_delivery(
                 wait_sap(session, 5.0)?;
                 if is_save {
                     session.find_by_id("wnd[0]/tbar[0]/btn[11]")?.call("press", vec![])?; // SAVE
+                    output_info.push(format!("{material} Date:{proce_date} 修改ZPZ3完成"));
                 }
-                output_info.push(format!("{material} Date:{proce_date} 修改ZPZ3完成"));
+                else {
+                    output_info.push(format!("{material} Date:{proce_date} 修改ZPZ3完成(未保存)"));
+                }
                 break;
             }
             if out_type.is_empty() || status.is_empty() {
@@ -257,18 +260,21 @@ pub fn change_out_bound_delivery(
 
         logger::info(app, &format!("ZPZ3 列表: {:?}", zpz3_list));
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let mut existing_date: Option<String> = None; // 保存已存在的 ZPZ3 日期，供后续日志打印
         for (status, pro_data) in &zpz3_list {
             if status == "S_TL_G" && pro_data == &today {
                 need_create = false;
-                logger::info(app, "今天已设置 ZPZ3");
+                existing_date = Some(pro_data.clone());
+                logger::info(app, &format!("{material} 今天已设置 ZPZ3，日期: {pro_data}"));
                 break;
             }
         }
 
         if need_create {
             if let Err(e) = set_cell_text(&output_table, end_row, 1, "ZPZ3") {
-                logger::warn(app, &format!("设置 ZPZ3 失败: {e}"));
-                return Ok(output_info);
+                logger::error(app, &format!("{material} 设置 ZPZ3 失败: {e}"));
+                output_info.push(format!("{material} 设置 ZPZ3 失败: {e}"));
+                break;
             }
             select_row(&output_table, end_row)?;
             session.find_by_id("wnd[0]/tbar[1]/btn[2]")?.call("press", vec![])?; // Communication
@@ -288,15 +294,22 @@ pub fn change_out_bound_delivery(
                 wait_sap(session, 5.0)?;
                 if is_save {
                     session.find_by_id("wnd[0]/tbar[0]/btn[11]")?.call("press", vec![])?; // SAVE
+                    output_info.push(format!("{material} Date:{today} 新增ZPZ3完成"));
                 }
-                output_info.push(format!("{material} Date:{today} 新增ZPZ3完成"));
+                else {
+                    output_info.push(format!("{material} Date:{today} 新增ZPZ3完成(未保存)"));
+                }
             } else {
                 output_info.push(format!("{material} 新增ZPZ3失败"));
-                logger::warn(app, "设置 Communication 后未找到黄色 ZPZ3");
-                return Ok(output_info);
+                logger::warn(app, &format!("{material} 设置 Communication 后未找到黄色 ZPZ3"));
+                break;
             }
         } else {
-            logger::info(app, "无需新增 ZPZ3");
+            let date_hint = existing_date
+                .as_deref()
+                .map(|d| format!("，日期：{d}"))
+                .unwrap_or_default();
+            logger::info(app, &format!("{material} 无需新增 ZPZ3 {date_hint}"));
         }
 
         session.find_by_id("wnd[0]/tbar[0]/btn[3]")?.call("press", vec![])?; // BACK
