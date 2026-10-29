@@ -1,0 +1,35 @@
+[package]
+name = "sap-toolbox"
+version = "1.0.0"
+description = "SAP 工具箱 - FD33 / VA03 / VL02N"
+authors = ["you"]
+edition = "2021"
+
+[lib]
+name = "sap_toolbox_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+
+# Windows COM / SAP GUI Scripting
+# 固定 0.52：该版本的 VARIANT 为 raw union，可直接访问 Anonymous.Anonymous.vt，
+# 是 SAP GUI / Excel 等 COM 自动化项目广泛验证过的稳定写法。
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.52", features = [
+  "Win32_Foundation",
+  "Win32_System_Com",
+  "Win32_System_Ole",
+  "Win32_System_Variant",
+] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
