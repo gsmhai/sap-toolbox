@@ -8,14 +8,26 @@
 //! 基于 windows 0.52 的 raw VARIANT（union）写法，参考社区成熟的 IDispatch late binding 实现。
 
 use windows::core::{BSTR, GUID, PCWSTR};
+use windows::Win32::Foundation::VARIANT_BOOL;
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_APARTMENTTHREADED,
-    DISPATCH_FLAGS, DISPATCH_METHOD, DISPATCH_PROPERTYGET, DISPATCH_PROPERTYPUT, DISPID_PROPERTYPUT,
-    IDispatch, DISPPARAMS,
+    DISPATCH_FLAGS, DISPATCH_METHOD, DISPATCH_PROPERTYGET, DISPATCH_PROPERTYPUT, IDispatch,
+    DISPPARAMS,
 };
 use windows::Win32::System::Variant::{
-    VariantInit, VARIANT, VT_BSTR, VT_DISPATCH, VT_EMPTY, VT_I4, VT_R8,
+    VariantInit, VARIANT, VT_BSTR, VT_BOOL, VT_DISPATCH, VT_I4, VT_R8,
 };
+
+/// DISPID_PROPERTYPUT：用于属性写入（property-put）时 rgdispidNamedArgs 的取值
+/// windows 0.52 的 crate 未导出该常量，这里按 COM 规范固定为 -3。
+const DISPID_PROPERTYPUT: i32 = -3;
+
+/// VARENUM 是元组结构体 `VARENUM(pub u16)`，不能在 match 臂中直接解构，
+/// 这里导出常用变体的底层 u16 值用于匹配。
+const VARENUM_BSTR: u16 = VT_BSTR.0;
+const VARENUM_I4: u16 = VT_I4.0;
+const VARENUM_R8: u16 = VT_R8.0;
+const VARENUM_DISPATCH: u16 = VT_DISPATCH.0;
 
 /// 包装一个 IDispatch 对象
 #[derive(Clone)]
@@ -127,16 +139,22 @@ impl Disp {
 
 // ---------- VARIANT 辅助（0.52 raw union） ----------
 
+/// 取得 VARIANT 内部结构体 VARIANT_0_0 与最内层联合体 VARIANT_0_0_0 的引用。
+/// 注意：VARIANT_0.Anonymous 是 `ManuallyDrop<VARIANT_0_0>`，必须显式解引用。
 fn variant_to_string(v: &VARIANT) -> Result<String, String> {
     unsafe {
-        match v.Anonymous.Anonymous.vt {
-            VT_EMPTY => Ok(String::new()),
-            VT_BSTR => Ok(v.Anonymous.Anonymous.Anonymous.bstrVal.to_string()),
-            VT_I4 => Ok(v.Anonymous.Anonymous.Anonymous.lVal.to_string()),
-            VT_R8 => Ok(v.Anonymous.Anonymous.Anonymous.dblVal.to_string()),
+        let s = &*v.Anonymous.Anonymous; // &VARIANT_0_0
+        let u = &s.Anonymous; // &VARIANT_0_0_0 联合体
+        match s.vt.0 {
+            VARENUM_BSTR => {
+                let b: &BSTR = &*u.bstrVal; // bstrVal: ManuallyDrop<BSTR>
+                Ok(b.to_string())
+            }
+            VARENUM_I4 => Ok(u.lVal.to_string()),
+            VARENUM_R8 => Ok(u.dblVal.to_string()),
             _ => {
-                // 尝试 BSTR 兜底
-                Ok(v.Anonymous.Anonymous.Anonymous.bstrVal.to_string())
+                let b: &BSTR = &*u.bstrVal;
+                Ok(b.to_string())
             }
         }
     }
@@ -144,16 +162,16 @@ fn variant_to_string(v: &VARIANT) -> Result<String, String> {
 
 fn variant_to_i32(v: &VARIANT) -> Result<i32, String> {
     unsafe {
-        match v.Anonymous.Anonymous.vt {
-            VT_I4 => Ok(v.Anonymous.Anonymous.Anonymous.lVal),
-            VT_BSTR => v
-                .Anonymous
-                .Anonymous
-                .Anonymous
-                .bstrVal
-                .to_string()
-                .parse::<i32>()
-                .map_err(|e| format!("字符串转整数失败: {e}")),
+        let s = &*v.Anonymous.Anonymous;
+        let u = &s.Anonymous;
+        match s.vt.0 {
+            VARENUM_I4 => Ok(u.lVal),
+            VARENUM_BSTR => {
+                let b: &BSTR = &*u.bstrVal;
+                b.to_string()
+                    .parse::<i32>()
+                    .map_err(|e| format!("字符串转整数失败: {e}"))
+            }
             _ => Ok(0),
         }
     }
@@ -161,16 +179,16 @@ fn variant_to_i32(v: &VARIANT) -> Result<i32, String> {
 
 fn variant_to_disp(v: &VARIANT) -> Result<Disp, String> {
     unsafe {
-        if v.Anonymous.Anonymous.vt == VT_DISPATCH {
-            let p = v.Anonymous.Anonymous.Anonymous.pdispVal;
-            if p.is_null() {
-                return Err("VARIANT 中的 IDispatch 为空".to_string());
+        let s = &*v.Anonymous.Anonymous;
+        let u = &s.Anonymous;
+        if s.vt.0 == VARENUM_DISPATCH {
+            let opt: &Option<IDispatch> = &*u.pdispVal; // pdispVal: ManuallyDrop<Option<IDispatch>>
+            match opt {
+                Some(disp) => return Ok(Disp::new(disp.clone())),
+                None => return Err("VARIANT 中的 IDispatch 为空".to_string()),
             }
-            let disp: IDispatch = std::mem::transmute_copy(&*p);
-            Ok(Disp::new(disp))
-        } else {
-            Err(format!("VARIANT 类型不是 IDispatch（vt={}）", v.Anonymous.Anonymous.vt))
         }
+        Err(format!("VARIANT 类型不是 IDispatch（vt={}）", s.vt.0))
     }
 }
 
@@ -208,9 +226,8 @@ fn progid_to_clsid(progid: &str) -> Result<GUID, String> {
     unsafe {
         let progid_w = windows::core::HSTRING::from(progid);
         let progid_pcwstr = PCWSTR::from_raw(progid_w.as_ptr());
-        let mut clsid = GUID::default();
-        CLSIDFromProgID(&progid_pcwstr, &mut clsid)
-            .map_err(|e| format!("ProgID {progid} 解析失败: {e}"))?;
+        let clsid =
+            CLSIDFromProgID(progid_pcwstr).map_err(|e| format!("ProgID {progid} 解析失败: {e}"))?;
         Ok(clsid)
     }
 }
@@ -326,11 +343,14 @@ impl Session {
 
 /// 构造一个 BSTR VARIANT
 pub fn str_variant(s: &str) -> VARIANT {
-    let b = BSTR::from(s);
+    let wide: Vec<u16> = s.encode_utf16().collect();
+    let b = BSTR::from_wide(&wide).expect("无法构造 BSTR（内存不足？）");
     unsafe {
         let mut v = VariantInit();
-        v.Anonymous.Anonymous.vt = VT_BSTR;
-        v.Anonymous.Anonymous.Anonymous.bstrVal = b;
+        // VARIANT_0.Anonymous 为 ManuallyDrop<VARIANT_0_0>，需显式解引用才能写字段
+        let body = &mut *v.Anonymous.Anonymous;
+        body.vt = VT_BSTR;
+        body.Anonymous.bstrVal = std::mem::ManuallyDrop::new(b);
         v
     }
 }
@@ -339,8 +359,9 @@ pub fn str_variant(s: &str) -> VARIANT {
 pub fn i32_variant(n: i32) -> VARIANT {
     unsafe {
         let mut v = VariantInit();
-        v.Anonymous.Anonymous.vt = VT_I4;
-        v.Anonymous.Anonymous.Anonymous.lVal = n;
+        let body = &mut *v.Anonymous.Anonymous;
+        body.vt = VT_I4;
+        body.Anonymous.lVal = n;
         v
     }
 }
@@ -349,9 +370,10 @@ pub fn i32_variant(n: i32) -> VARIANT {
 pub fn bool_variant(b: bool) -> VARIANT {
     unsafe {
         let mut v = VariantInit();
-        v.Anonymous.Anonymous.vt = windows::Win32::System::Variant::VT_BOOL;
+        let body = &mut *v.Anonymous.Anonymous;
+        body.vt = VT_BOOL;
         // VARIANT_BOOL: -1 = VARIANT_TRUE, 0 = VARIANT_FALSE
-        v.Anonymous.Anonymous.Anonymous.boolVal = if b { -1 } else { 0 };
+        body.Anonymous.boolVal = VARIANT_BOOL(if b { -1 } else { 0 });
         v
     }
 }

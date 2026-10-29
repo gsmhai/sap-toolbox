@@ -6,7 +6,7 @@ mod sap_ops;
 
 use std::sync::Mutex;
 
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, State};
 
 use sap_com::{cleanup_com, connect_sap_gui, get_session, list_sessions, wait_sap, Session};
 use sap_ops::{change_out_bound_delivery, get_customer_credit_info, get_order_amount};

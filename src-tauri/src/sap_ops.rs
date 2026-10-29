@@ -224,7 +224,7 @@ pub fn change_out_bound_delivery(
             let proce_date = get_cell_text(&output_table, j, 8)?;
 
             if out_type == "ZPZ3" {
-                zpz3_list.push((status.clone(), proce_date));
+                zpz3_list.push((status.clone(), proce_date.clone()));
             }
             if out_type == "ZPZ3" && status == "S_TL_Y" {
                 logger::info(app, &format!("找到需修改的 ZPZ3，行: {j}"));
