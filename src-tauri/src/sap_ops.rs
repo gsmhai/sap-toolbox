@@ -260,12 +260,21 @@ pub fn change_out_bound_delivery(
 
         logger::info(app, &format!("ZPZ3 列表: {:?}", zpz3_list));
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let today_date = chrono::Local::now().date_naive();
         let mut existing_date: Option<String> = None; // 保存已存在的 ZPZ3 日期，供后续日志打印
         for (status, pro_data) in &zpz3_list {
-            if status == "S_TL_G" && pro_data == &today {
+            // 3 天内（含今天；过去/未来都算）已处理的 ZPZ3 视为无需新增
+            let within_days = match chrono::NaiveDate::parse_from_str(pro_data, "%Y-%m-%d") {
+                Ok(d) => (today_date - d).num_days().abs() <= 3,
+                Err(_) => {
+                    logger::warn(app, &format!("{material} ZPZ3 处理日期无法解析: {pro_data}"));
+                    false
+                }
+            };
+            if status == "S_TL_G" && within_days {
                 need_create = false;
                 existing_date = Some(pro_data.clone());
-                logger::info(app, &format!("{material} 今天已设置 ZPZ3，日期: {pro_data}"));
+                logger::info(app, &format!("{material} 3天内已设置 ZPZ3，日期: {pro_data}"));
                 break;
             }
         }
