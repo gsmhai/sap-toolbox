@@ -5,6 +5,7 @@ node_modules/
 dist/
 dist-ssr/
 src-tauri/target/
+src-tauri/gen/
 
 # IDE
 .vscode/
@@ -20,3 +21,4 @@ Thumbs.db
 
 # Logs
 *.log
+src-tauri/Cargo.lock

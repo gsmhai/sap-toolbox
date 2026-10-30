@@ -46,17 +46,35 @@ jobs:
         run: |
           $exe = Get-ChildItem -Path "src-tauri\target\release" -Filter "*.exe" | Where-Object { $_.Name -notmatch '\.deps' } | Select-Object -First 1
           if ($exe) {
-            Copy-Item $exe.FullName "SAPToolbox-v${{ inputs.version }}-portable.exe"
-            Write-Host "Portable exe: $($exe.Name)"
+            Copy-Item $exe.FullName "SAPToolbox-v${{ inputs.version }}.exe"
+            Write-Host "Portable exe: $($exe.Name) -> SAPToolbox-v${{ inputs.version }}.exe"
           } else {
             Write-Host "未找到 release exe"
+          }
+
+      - name: 压缩成 zip 包
+        shell: pwsh
+        run: |
+          $exe = "SAPToolbox-v${{ inputs.version }}.exe"
+          if (Test-Path $exe) {
+            Compress-Archive -Path $exe -DestinationPath "SAPToolbox-v${{ inputs.version }}.zip" -Force
+            Write-Host "Zip: SAPToolbox-v${{ inputs.version }}.zip"
+          } else {
+            Write-Host "未找到待压缩的 exe"
           }
 
       - name: 上传绿色免安装单 exe (Artifact)
         uses: actions/upload-artifact@v4
         with:
-          name: SAPToolbox-portable
-          path: SAPToolbox-v${{ inputs.version }}-portable.exe
+          name: SAPToolbox-exe
+          path: SAPToolbox-v${{ inputs.version }}.exe
+          if-no-files-found: warn
+
+      - name: 上传 zip 压缩包 (Artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: SAPToolbox-zip
+          path: SAPToolbox-v${{ inputs.version }}.zip
           if-no-files-found: warn
 
       - name: 发布到 GitHub Release
@@ -67,9 +85,11 @@ jobs:
           body: |
             手动触发的 Windows 构建产物。
 
-            - `SAPToolbox-v${{ inputs.version }}-portable.exe`：绿色免安装单文件，双击即可运行（需目标机为 Win10/11 且自带 WebView2 运行时）。
+            - `SAPToolbox-v${{ inputs.version }}.exe`：绿色免安装单文件，双击即可运行（需目标机为 Win10/11 且自带 WebView2 运行时）。
+            - `SAPToolbox-v${{ inputs.version }}.zip`：上述 exe 的 zip 压缩包。
           files: |
-            SAPToolbox-v${{ inputs.version }}-portable.exe
+            SAPToolbox-v${{ inputs.version }}.exe
+            SAPToolbox-v${{ inputs.version }}.zip
           draft: false
           prerelease: false
         env:

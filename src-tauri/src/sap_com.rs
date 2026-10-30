@@ -10,9 +10,8 @@
 use windows::core::{BSTR, GUID, PCWSTR};
 use windows::Win32::Foundation::VARIANT_BOOL;
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_APARTMENTTHREADED,
-    DISPATCH_FLAGS, DISPATCH_METHOD, DISPATCH_PROPERTYGET, DISPATCH_PROPERTYPUT, IDispatch,
-    DISPPARAMS,
+    CoGetObject, CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, DISPATCH_FLAGS,
+    DISPATCH_METHOD, DISPATCH_PROPERTYGET, DISPATCH_PROPERTYPUT, IDispatch, DISPPARAMS,
 };
 use windows::Win32::System::Variant::{
     VariantInit, VARIANT, VT_BSTR, VT_BOOL, VT_DISPATCH, VT_I4, VT_R8,
@@ -200,36 +199,33 @@ pub fn variant_to_disp_public(v: &VARIANT) -> Result<Disp, String> {
 // ---------- SAP 对象模型 ----------
 
 /// 连接到 SAP GUI 并返回 Application 的 IDispatch
+///
+/// 等价于原 test.py 的 `win32com.client.GetObject("SAPGUI")`：
+/// 通过 COM 运行对象表（ROT）取回正在运行的 SAP GUI 脚本对象（moniker），
+/// 再调用 `GetScriptingEngine` 拿到 GuiApplication。
+///
+/// 注意：不能用 `CLSIDFromProgID("SAPGUI") + CoCreateInstance`。
+/// "SAPGUI" 是 ROT 中的 moniker 名称，并非已注册的 ProgID，
+/// 直接解析会报 `0x800401F3`（CO_E_CLASSSTRING / 无效的类字符串）。
 pub fn connect_sap_gui() -> Result<Disp, String> {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
     }
-    let clsid = progid_to_clsid("SAPGUI")?;
+    let name_w = windows::core::HSTRING::from("SAPGUI");
+    let name_pcwstr = PCWSTR::from_raw(name_w.as_ptr());
     let sap_gui: IDispatch = unsafe {
-        CoCreateInstance(&clsid, None, CLSCTX_ALL).map_err(|e| {
-            format!(
-                "无法连接 SAP GUI（SAPGUI COM 对象创建失败: {e}）。\n\
-                 请确认：\n\
-                 1. 已启动 SAP Logon 并登录至少一个会话；\n\
-                 2. SAP GUI 选项 -> 辅助功能与脚本 -> 脚本 -> 已启用（允许脚本）"
-            )
-        })?
+        CoGetObject(name_pcwstr, None).map_err(|e| format!(
+            "无法连接 SAP GUI（CoGetObject(\"SAPGUI\") 失败: {e}）。\n\
+             请确认：\n\
+             1. 已启动 SAP Logon 并至少登录一个会话；\n\
+             2. SAP GUI 选项 -> 辅助功能与脚本 -> 脚本 -> 已启用（允许脚本）；\n\
+             3. 控制面板 -> SAP Front End -> 勾选“启用脚本”（本机已注册 SAP GUI Scripting）。\n\
+             若仍报 0x800401F3，请确认 SAP Logon 处于运行状态。"
+        ))?
     };
     let sap_gui_disp = Disp::new(sap_gui);
     let app = sap_gui_disp.get_disp("GetScriptingEngine")?;
     Ok(app)
-}
-
-/// 通过 ProgID 获取 CLSID
-fn progid_to_clsid(progid: &str) -> Result<GUID, String> {
-    use windows::Win32::System::Com::CLSIDFromProgID;
-    unsafe {
-        let progid_w = windows::core::HSTRING::from(progid);
-        let progid_pcwstr = PCWSTR::from_raw(progid_w.as_ptr());
-        let clsid =
-            CLSIDFromProgID(progid_pcwstr).map_err(|e| format!("ProgID {progid} 解析失败: {e}"))?;
-        Ok(clsid)
-    }
 }
 
 /// SAP 集合对象的 Count 属性
