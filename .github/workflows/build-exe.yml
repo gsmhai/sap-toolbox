@@ -46,18 +46,78 @@ jobs:
         run: |
           $exe = Get-ChildItem -Path "src-tauri\target\release" -Filter "*.exe" | Where-Object { $_.Name -notmatch '\.deps' } | Select-Object -First 1
           if ($exe) {
-            Copy-Item $exe.FullName "SAPToolbox-v${{ inputs.version }}-portable.exe"
-            Write-Host "Portable exe: $($exe.Name)"
+            Copy-Item $exe.FullName "SAPToolbox-v${{ inputs.version }}.exe"
+            Write-Host "Portable exe: $($exe.Name) -> SAPToolbox-v${{ inputs.version }}.exe"
           } else {
             Write-Host "未找到 release exe"
           }
 
+      - name: 压缩成 7z 包（AES256 加密 + 文件名加密）
+        shell: pwsh
+        run: |
+          $version = "${{ inputs.version }}"
+          $exe = "SAPToolbox-v$version.exe"
+          $archive = "sbx.7z"
+          $password = "a1234"
+
+          if (-not (Test-Path $exe)) {
+            Write-Host "未找到待压缩的 exe: $exe"
+            exit 1
+          }
+
+          # windows-latest runner 预装 7-Zip，做多路径探测兜底
+          $sevenZip = $null
+          foreach ($candidate in @(
+            "C:\Program Files\7-Zip\7z.exe",
+            "C:\Program Files (x86)\7-Zip\7z.exe",
+            "C:\ProgramData\chocolatey\bin\7z.exe"
+          )) {
+            if (Test-Path $candidate) { $sevenZip = $candidate; break }
+          }
+          if (-not $sevenZip) {
+            $cmd = Get-Command 7z.exe -ErrorAction SilentlyContinue
+            if ($cmd) { $sevenZip = $cmd.Source }
+          }
+          if (-not $sevenZip) {
+            Write-Host "未找到 7-Zip，无法生成加密包"
+            exit 1
+          }
+
+          # 日志里遮蔽密码
+          Write-Host "::add-mask::$password"
+
+          if (Test-Path $archive) { Remove-Item $archive -Force }
+
+          # -mhe=on 连文件名列表一起加密（7z 独有能力）
+          # 注意：不要加 -mem=AES256，它是 7-Zip GUI 的设置项，不是命令行开关，
+          #       传入会让 7z 报 "The parameter is incorrect." 并退出码 2。
+          #       7z 格式默认加密算法就是 AES-256（归档属性显示 7zAES），无需显式指定。
+          & $sevenZip a -t7z -mx=9 -mhe=on "-p$password" $archive $exe | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "7z 压缩失败，退出码: $LASTEXITCODE"
+            exit 1
+          }
+
+          if (-not (Test-Path $archive)) {
+            Write-Host "压缩失败：未生成 $archive"
+            exit 1
+          }
+          Get-Item $archive | Select-Object Name, Length | Format-List
+          (Get-FileHash $archive -Algorithm SHA256).Hash
+
       - name: 上传绿色免安装单 exe (Artifact)
         uses: actions/upload-artifact@v4
         with:
-          name: SAPToolbox-portable
-          path: SAPToolbox-v${{ inputs.version }}-portable.exe
+          name: SAPToolbox-exe
+          path: SAPToolbox-v${{ inputs.version }}.exe
           if-no-files-found: warn
+
+      - name: 上传 7z 压缩包 (Artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: SAPToolbox-7z
+          path: sbx.7z
+          if-no-files-found: error
 
       - name: 发布到 GitHub Release
         uses: softprops/action-gh-release@v2
@@ -67,9 +127,13 @@ jobs:
           body: |
             手动触发的 Windows 构建产物。
 
-            - `SAPToolbox-v${{ inputs.version }}-portable.exe`：绿色免安装单文件，双击即可运行（需目标机为 Win10/11 且自带 WebView2 运行时）。
+            - `SAPToolbox-v${{ inputs.version }}.exe`：绿色免安装单文件，双击即可运行（需目标机为 Win10/11 且自带 WebView2 运行时）。
+            - `sbx.7z`：加密压缩包（AES-256 + 文件名加密），解压密码：`a1234`
+
+            提示：Windows 资源管理器不支持解压 7z，请使用 7-Zip / WinRAR 解压。
           files: |
-            SAPToolbox-v${{ inputs.version }}-portable.exe
+            SAPToolbox-v${{ inputs.version }}.exe
+            sbx.7z
           draft: false
           prerelease: false
         env:
