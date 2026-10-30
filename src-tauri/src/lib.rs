@@ -9,7 +9,9 @@ use std::sync::Mutex;
 use tauri::{AppHandle, State};
 
 use sap_com::{cleanup_com, connect_sap_gui, get_session, list_sessions, wait_sap, Session};
-use sap_ops::{change_out_bound_delivery, get_customer_credit_info, get_order_amount};
+use sap_ops::{
+    change_out_bound_delivery, get_customer_credit_info, get_order_amount, get_order_amounts,
+};
 
 /// 全局状态：记录当前是否正在执行操作（防止并发操作 SAP 会话）
 struct BusyState(Mutex<bool>);
@@ -73,6 +75,19 @@ fn query_order_amount(app: AppHandle, state: State<'_, BusyState>, order_no: Str
     }
     let result = run_with_session(&app, conn_idx, sess_idx, |session| {
         get_order_amount(&app, session, &order_no, only_head)
+    });
+    state.unlock();
+    result
+}
+
+/// 订单金额批量查询（只进入一次 VA03，在事务内逐个切换订单号）
+#[tauri::command]
+fn query_order_amounts(app: AppHandle, state: State<'_, BusyState>, order_nos: Vec<String>, only_head: bool, conn_idx: i32, sess_idx: i32) -> Result<Vec<(String, f64)>, String> {
+    if !state.try_lock() {
+        return Err("上一个操作还在执行，请等待完成".to_string());
+    }
+    let result = run_with_session(&app, conn_idx, sess_idx, |session| {
+        get_order_amounts(&app, session, &order_nos, only_head)
     });
     state.unlock();
     result
@@ -143,6 +158,7 @@ pub fn run() {
             refresh_sessions,
             query_credit,
             query_order_amount,
+            query_order_amounts,
             modify_delivery,
             get_log_dir,
             export_csv,

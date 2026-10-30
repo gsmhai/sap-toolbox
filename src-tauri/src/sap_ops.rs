@@ -72,7 +72,7 @@ pub fn get_order_amount(
     order_no: &str,
     only_head: bool,
 ) -> Result<f64, String> {
-    logger::info(app, &format!("VA03 查询订单金额: {order_no} (onlyHead={only_head}) ..."));
+    logger::info(app, &format!("VA03 查询订单金额: {order_no} ..."));
     session.maximize()?;
     session.start_transaction("VA03")?;
     wait_sap(session, 5.0)?;
@@ -88,49 +88,101 @@ pub fn get_order_amount(
             "wnd[0]/usr/subSUBSCREEN_HEADER:SAPMV45A:4021/txtVBAK-NETWR",
         )?);
     } else {
-        session
-            .find_by_id("wnd[0]/usr/subSUBSCREEN_HEADER:SAPMV45A:4021/btnBT_HEAD")?
-            .call("press", vec![])?;
-        wait_sap(session, 5.0)?;
-        session
-            .find_by_id(r"wnd[0]/usr/tabsTAXI_TABSTRIP_HEAD/tabpT\05")?
-            .call("select", vec![])?;
-
-        let price_table = session.find_by_id(
-            r"wnd[0]/usr/tabsTAXI_TABSTRIP_HEAD/tabpT\05/ssubSUBSCREEN_BODY:SAPLV69A:6201/tblSAPLV69ATCTRL_KONDITIONEN",
-        )?;
-
-        let columns = price_table.get_disp("Columns")?;
-        let col_count = collection_count(&columns);
-        let mut col: i32 = 0;
-        let mut desc_col: i32 = 0;
-        for i in 0..col_count {
-            let column = columns.item(i)?;
-            let title = column.get_str("Title").unwrap_or_default();
-            if title == "Description" {
-                desc_col = i;
-            } else if title == "Condition Value" {
-                col = i;
-                break;
-            }
-        }
-
-        let rows = price_table.get_disp("Rows")?;
-        let row_count = collection_count(&rows);
-        let mut row: i32 = 0;
-        for i in 0..row_count {
-            let desc = get_cell_text(&price_table, i, desc_col)?;
-            if desc.contains("Total amount") {
-                row = i;
-                break;
-            }
-        }
-        amount = parse_amount(&get_cell_text(&price_table, row, col)?);
-        session.send_vkey(3)?; // BACK
+        amount = read_price_total(session)?;
     }
 
     logger::info(app, &format!("订单 {order_no} 金额: {amount}"));
     Ok(amount)
+}
+
+/// 打开定价页签并读取 "Total amount" 行的条件值（读到后按一次 BACK 退出页签）
+fn read_price_total(session: &Session) -> Result<f64, String> {
+    session
+        .find_by_id("wnd[0]/usr/subSUBSCREEN_HEADER:SAPMV45A:4021/btnBT_HEAD")?
+        .call("press", vec![])?;
+    wait_sap(session, 5.0)?;
+    session
+        .find_by_id(r"wnd[0]/usr/tabsTAXI_TABSTRIP_HEAD/tabpT\05")?
+        .call("select", vec![])?;
+
+    let price_table = session.find_by_id(
+        r"wnd[0]/usr/tabsTAXI_TABSTRIP_HEAD/tabpT\05/ssubSUBSCREEN_BODY:SAPLV69A:6201/tblSAPLV69ATCTRL_KONDITIONEN",
+    )?;
+
+    let columns = price_table.get_disp("Columns")?;
+    let col_count = collection_count(&columns);
+    let mut col: i32 = 0;
+    let mut desc_col: i32 = 0;
+    for i in 0..col_count {
+        let column = columns.item(i)?;
+        let title = column.get_str("Title").unwrap_or_default();
+        if title == "Description" {
+            desc_col = i;
+        } else if title == "Condition Value" {
+            col = i;
+            break;
+        }
+    }
+
+    let rows = price_table.get_disp("Rows")?;
+    let row_count = collection_count(&rows);
+    let mut row: i32 = 0;
+    for i in 0..row_count {
+        let desc = get_cell_text(&price_table, i, desc_col)?;
+        if desc.contains("Total amount") {
+            row = i;
+            break;
+        }
+    }
+
+    let amount = parse_amount(&get_cell_text(&price_table, row, col)?);
+    session.send_vkey(3)?; // BACK（退出定价页签）
+    Ok(amount)
+}
+
+/// ②b 订单金额批量查询：只进入一次 VA03，在事务内逐个切换订单号
+pub fn get_order_amounts(
+    app: &AppHandle,
+    session: &Session,
+    order_nos: &[String],
+    only_head: bool,
+) -> Result<Vec<(String, f64)>, String> {
+    logger::info(
+        app,
+        &format!(
+            "VA03 批量查询订单金额(单次进入事务): {} 个 (onlyHead={only_head}) ...",
+            order_nos.len()
+        ),
+    );
+    session.maximize()?;
+    session.start_transaction("VA03")?;
+    wait_sap(session, 5.0)?;
+
+    let mut results: Vec<(String, f64)> = Vec::new();
+    for order_no in order_nos {
+        wait_sap(session, 5.0)?;
+        session.set_text("wnd[0]/usr/ctxtVBAK-VBELN", order_no)?;
+        session.send_vkey(0)?;
+        wait_sap(session, 5.0)?;
+        session.send_vkey(0)?;
+        wait_sap(session, 5.0)?;
+
+        let amount = if only_head {
+            parse_amount(&session.get_text(
+                "wnd[0]/usr/subSUBSCREEN_HEADER:SAPMV45A:4021/txtVBAK-NETWR",
+            )?)
+        } else {
+            read_price_total(session)?
+        };
+
+        logger::info(app, &format!("订单 {order_no} 金额: {amount}"));
+        results.push((order_no.clone(), amount));
+
+        // 连按两次 BACK 回到 VA03 初始界面，再继续下一个订单号
+        session.send_vkey(3)?;
+        session.send_vkey(3)?;
+    }
+    Ok(results)
 }
 
 /// 读取集合 Count 属性（不抛错，失败返回 0）
@@ -249,10 +301,10 @@ pub fn change_out_bound_delivery(
                 wait_sap(session, 5.0)?;
                 if is_save {
                     session.find_by_id("wnd[0]/tbar[0]/btn[11]")?.call("press", vec![])?; // SAVE
-                    output_info.push(format!("{material} Date:{proce_date} 修改ZPZ3完成"));
+                    output_info.push(format!("{material} {proce_date} 修改ZPZ3完成"));
                 }
                 else {
-                    output_info.push(format!("{material} Date:{proce_date} 修改ZPZ3完成(未保存)"));
+                    output_info.push(format!("{material} {proce_date} 修改ZPZ3完成(未保存)"));
                 }
                 break;
             }
@@ -308,10 +360,10 @@ pub fn change_out_bound_delivery(
                 wait_sap(session, 5.0)?;
                 if is_save {
                     session.find_by_id("wnd[0]/tbar[0]/btn[11]")?.call("press", vec![])?; // SAVE
-                    output_info.push(format!("{material} Date:{today} 新增ZPZ3完成"));
+                    output_info.push(format!("{material} {today} 新增ZPZ3完成"));
                 }
                 else {
-                    output_info.push(format!("{material} Date:{today} 新增ZPZ3完成(未保存)"));
+                    output_info.push(format!("{material} {today} 新增ZPZ3完成(未保存)"));
                 }
             } else {
                 output_info.push(format!("{material} 新增ZPZ3失败"));

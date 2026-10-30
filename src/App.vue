@@ -26,8 +26,9 @@ function currentSession(): { connIdx: number; sessIdx: number } {
 const customerCode = ref("");
 const orderIds = ref("");
 const onlyHead = ref(true);
+const batchMode = ref(false); // 调试用：切换"单次进入 VA03 批量查询"与"逐条进入 VA03 查询"
 const orderRows = ref<Array<{ orderId: string; amount: string }>>([]);
-const orderSummary = ref("");
+const orderSummary = ref("合计（共 0 个）：0.00");
 
 const deliveryId = ref("");
 const autoSave = ref(true);
@@ -196,28 +197,58 @@ async function runOrders() {
     return;
   }
   busy.value = true;
+  const t0 = performance.now();
+  const modeLabel = batchMode.value ? "批量·单次进入 VA03" : "单条·逐条进入 VA03";
   orderRows.value = ids.map((orderId) => ({ orderId, amount: "查询中..." }));
   let total = 0;
   let count = 0;
 
-  for (const id of ids) {
-    try {
-      const val = await invoke<number>("query_order_amount", {
-        orderNo: id,
+  try {
+    if (batchMode.value) {
+      // 新方案：只进入一次 VA03，在事务内逐个切换订单号
+      const res = await invoke<Array<[string, number]>>("query_order_amounts", {
+        orderNos: ids,
         onlyHead: onlyHead.value,
         connIdx: currentSession().connIdx,
         sessIdx: currentSession().sessIdx,
       });
-      const row = orderRows.value.find((r) => r.orderId === id && r.amount === "查询中...");
-      if (row) row.amount = fmt(val);
-      total += val;
-      count++;
-    } catch (e) {
-      const row = orderRows.value.find((r) => r.orderId === id && r.amount === "查询中...");
-      if (row) row.amount = `ERROR: ${e}`;
+      for (const [orderId, val] of res) {
+        const row = orderRows.value.find((r) => r.orderId === orderId);
+        if (row) row.amount = fmt(val);
+        total += val;
+        count++;
+      }
+    } else {
+      // 原方案：每个订单号都重新进入一次 VA03
+      for (const id of ids) {
+        try {
+          const val = await invoke<number>("query_order_amount", {
+            orderNo: id,
+            onlyHead: onlyHead.value,
+            connIdx: currentSession().connIdx,
+            sessIdx: currentSession().sessIdx,
+          });
+          const row = orderRows.value.find((r) => r.orderId === id && r.amount === "查询中...");
+          if (row) row.amount = fmt(val);
+          total += val;
+          count++;
+        } catch (e) {
+          const row = orderRows.value.find((r) => r.orderId === id && r.amount === "查询中...");
+          if (row) row.amount = `ERROR: ${e}`;
+        }
+      }
     }
+  } catch (e) {
+    appendLog({ time: now(), level: "ERROR", message: `批量查询失败: ${e}` });
   }
-  orderSummary.value = `合计（共 ${count} 个 Order ID）：${fmt(total)}`;
+
+  const elapsed = (performance.now() - t0) / 1000;
+  orderSummary.value = `合计（共 ${count} 个）：${fmt(total)}`;
+  appendLog({
+    time: now(),
+    level: "INFO",
+    message: `订单查询完成 [${modeLabel}]，${count} 个，耗时 ${elapsed.toFixed(2)} 秒`,
+  });
   busy.value = false;
 }
 
@@ -384,6 +415,10 @@ onMounted(async () => {
               ></textarea>
             </div>
             <div class="btn-col">
+              <label class="checkbox mode-toggle" title="切换：批量=只进入一次 VA03 逐个切换订单号；单条=每个订单号都重新进入 VA03">
+                <input type="checkbox" v-model="batchMode" />
+                批量模式
+              </label>
               <button class="btn primary" :disabled="busy" @click="runOrders">批量查询金额</button>
               <button class="btn small" :disabled="orderRows.length === 0" @click="copyText(orderTableText(), '订单表格')">复制表格</button>
               <button class="btn small" :disabled="orderRows.length === 0" @click="exportOrders">导出 CSV</button>
@@ -398,12 +433,12 @@ onMounted(async () => {
                     <td>{{ row.orderId }}</td>
                     <td>{{ row.amount }}</td>
                   </tr>
-                  <tr v-if="orderRows.length > 0" class="summary">
-                    <td class="bold red">{{ orderSummary }}</td>
-                    <td class="bold red"></td>
-                  </tr>
                   <tr v-if="orderRows.length === 0" class="placeholder-row">
                     <td colspan="2" class="empty">（未查询）</td>
+                  </tr>
+                  <tr class="summary">
+                    <td class="bold red">{{ orderSummary }}</td>
+                    <td class="bold red"></td>
                   </tr>
                 </tbody>
               </table>
@@ -792,6 +827,10 @@ body {
   gap: 8px;
   width: 124px;
   flex-shrink: 0;
+}
+
+.mode-toggle {
+  align-self: flex-start;
 }
 
 /* ===== 表格 ===== */
