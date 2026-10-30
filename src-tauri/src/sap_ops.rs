@@ -5,7 +5,7 @@
 //!
 //! 每个操作接收 AppHandle，把进度信息输出到前端日志面板 + 日志文件。
 
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
 
 use crate::logger;
 use crate::sap_com::{bool_variant, i32_variant, parse_amount, str_variant, variant_to_disp_public, wait_sap, Disp, Session};
@@ -71,8 +71,9 @@ pub fn get_order_amount(
     session: &Session,
     order_no: &str,
     only_head: bool,
+    is_last: bool,
 ) -> Result<f64, String> {
-    logger::info(app, &format!("VA03 查询订单金额: {order_no} (onlyHead={only_head}) ..."));
+    logger::info(app, &format!("VA03 查询订单金额: {order_no} (is_last={is_last}) ..."));
     session.maximize()?;
     session.start_transaction("VA03")?;
     wait_sap(session, 5.0)?;
@@ -88,49 +89,172 @@ pub fn get_order_amount(
             "wnd[0]/usr/subSUBSCREEN_HEADER:SAPMV45A:4021/txtVBAK-NETWR",
         )?);
     } else {
-        session
-            .find_by_id("wnd[0]/usr/subSUBSCREEN_HEADER:SAPMV45A:4021/btnBT_HEAD")?
-            .call("press", vec![])?;
-        wait_sap(session, 5.0)?;
-        session
-            .find_by_id(r"wnd[0]/usr/tabsTAXI_TABSTRIP_HEAD/tabpT\05")?
-            .call("select", vec![])?;
-
-        let price_table = session.find_by_id(
-            r"wnd[0]/usr/tabsTAXI_TABSTRIP_HEAD/tabpT\05/ssubSUBSCREEN_BODY:SAPLV69A:6201/tblSAPLV69ATCTRL_KONDITIONEN",
-        )?;
-
-        let columns = price_table.get_disp("Columns")?;
-        let col_count = collection_count(&columns);
-        let mut col: i32 = 0;
-        let mut desc_col: i32 = 0;
-        for i in 0..col_count {
-            let column = columns.item(i)?;
-            let title = column.get_str("Title").unwrap_or_default();
-            if title == "Description" {
-                desc_col = i;
-            } else if title == "Condition Value" {
-                col = i;
-                break;
-            }
-        }
-
-        let rows = price_table.get_disp("Rows")?;
-        let row_count = collection_count(&rows);
-        let mut row: i32 = 0;
-        for i in 0..row_count {
-            let desc = get_cell_text(&price_table, i, desc_col)?;
-            if desc.contains("Total amount") {
-                row = i;
-                break;
-            }
-        }
-        amount = parse_amount(&get_cell_text(&price_table, row, col)?);
-        session.send_vkey(3)?; // BACK
+        amount = read_price_total(session)?;
     }
 
     logger::info(app, &format!("订单 {order_no} 金额: {amount}"));
+
+    // 收尾导航（计入本函数耗时）：仅最后一条订单（is_last=true）退出 VA03，
+    // 与 Python GetOrderAmount 的 isLast 一致：退回订单号输入页 -> 退出 VA03；
+    // 其余订单不额外 BACK，由下一次 start_transaction 重新进入 VA03。
+    // 收尾失败不影响已读到的金额，故忽略单次 BACK 错误。
+    if is_last {
+        let _ = session.send_vkey(3); // BACK：退回 VA03 初始输入界面
+        let _ = session.send_vkey(3); // BACK：退出 VA03
+    }
+
     Ok(amount)
+}
+
+/// 打开定价页签并读取 "Total amount" 行的条件值（读到后按一次 BACK 退出页签）
+fn read_price_total(session: &Session) -> Result<f64, String> {
+    session
+        .find_by_id("wnd[0]/usr/subSUBSCREEN_HEADER:SAPMV45A:4021/btnBT_HEAD")?
+        .call("press", vec![])?;
+    wait_sap(session, 5.0)?;
+    session
+        .find_by_id(r"wnd[0]/usr/tabsTAXI_TABSTRIP_HEAD/tabpT\05")?
+        .call("select", vec![])?;
+
+    let price_table = session.find_by_id(
+        r"wnd[0]/usr/tabsTAXI_TABSTRIP_HEAD/tabpT\05/ssubSUBSCREEN_BODY:SAPLV69A:6201/tblSAPLV69ATCTRL_KONDITIONEN",
+    )?;
+
+    let columns = price_table.get_disp("Columns")?;
+    let col_count = collection_count(&columns);
+    let mut col: i32 = 0;
+    let mut desc_col: i32 = 0;
+    for i in 0..col_count {
+        let column = columns.item(i)?;
+        let title = column.get_str("Title").unwrap_or_default();
+        if title == "Description" {
+            desc_col = i;
+        } else if title == "Condition Value" {
+            col = i;
+            break;
+        }
+    }
+
+    let rows = price_table.get_disp("Rows")?;
+    let row_count = collection_count(&rows);
+    let mut row: i32 = 0;
+    for i in 0..row_count {
+        let desc = get_cell_text(&price_table, i, desc_col)?;
+        if desc.contains("Total amount") {
+            row = i;
+            break;
+        }
+    }
+
+    let amount = parse_amount(&get_cell_text(&price_table, row, col)?);
+    session.send_vkey(3)?; // BACK（退出定价页签）
+    Ok(amount)
+}
+
+/// VA03 订单号输入框（也是判断"是否回到初始界面"的标志）
+const ORDER_ENTRY_ID: &str = "wnd[0]/usr/ctxtVBAK-VBELN";
+/// VA03 抬头净值字段
+const NETWR_ID: &str = "wnd[0]/usr/subSUBSCREEN_HEADER:SAPMV45A:4021/txtVBAK-NETWR";
+
+/// 确认已经回到 VA03 初始输入界面（找不到订单号输入框就再按 BACK，最多重试 3 次）
+fn back_to_order_entry(app: &AppHandle, session: &Session) -> Result<(), String> {
+    for attempt in 1..=3 {
+        wait_sap(session, 2.0)?;
+        if session.find_by_id(ORDER_ENTRY_ID).is_ok() {
+            return Ok(());
+        }
+        logger::warn(app, &format!("未回到 VA03 初始界面，第 {attempt} 次 BACK"));
+        session
+            .send_vkey(3)
+            .map_err(|e| format!("按 BACK 失败: {e}"))?;
+    }
+    Err("连按 3 次 BACK 后仍未回到 VA03 初始界面".to_string())
+}
+
+/// 向前端推送单条订单的查询进度（批量模式下让表格逐行刷新）
+/// index 为订单在入参中的下标，前端按下标回填，避免重复订单号时定位错行。
+fn emit_progress(app: &AppHandle, index: usize, order_no: &str, amount: f64, error: &str) {
+    let _ = app.emit(
+        "order-amount://progress",
+        serde_json::json!({
+            "index": index,
+            "orderNo": order_no,
+            "amount": amount,
+            "error": error,
+        }),
+    );
+}
+
+/// ②b 订单金额批量查询：只进入一次 VA03，在事务内逐个切换订单号
+/// 返回 (订单号, 金额, 错误信息)；错误信息为空表示成功。单个订单失败不会中断整批。
+/// 每完成一单都会 emit `order-amount://progress`，前端据此逐行更新。
+pub fn get_order_amounts(
+    app: &AppHandle,
+    session: &Session,
+    order_nos: &[String],
+    only_head: bool,
+) -> Result<Vec<(String, f64, String)>, String> {
+    logger::info(
+        app,
+        &format!(
+            "VA03 批量查询订单金额: {} 个 (Head={only_head}) ...",
+            order_nos.len()
+        ),
+    );
+    session.maximize()?;
+    session.start_transaction("VA03")?;
+    wait_sap(session, 5.0)?;
+
+    let mut results: Vec<(String, f64, String)> = Vec::new();
+    for (idx, order_no) in order_nos.iter().enumerate() {
+        // 除第一个外，先确认已经退回到 VA03 初始界面
+        if idx > 0 {
+            if let Err(e) = back_to_order_entry(app, session) {
+                let msg = format!("准备下一个订单失败: {e}");
+                results.push((order_no.clone(), 0.0, msg.clone()));
+                emit_progress(app, idx, order_no, 0.0, &msg);
+                continue;
+            }
+        }
+
+        let one = || -> Result<f64, String> {
+            session
+                .set_text(ORDER_ENTRY_ID, order_no)
+                .map_err(|e| format!("设置订单号失败: {e}"))?;
+            session
+                .send_vkey(0)
+                .map_err(|e| format!("首次回车失败: {e}"))?;
+            wait_sap(session, 5.0)?;
+            session
+                .send_vkey(0)
+                .map_err(|e| format!("第二次回车失败: {e}"))?;
+            wait_sap(session, 5.0)?;
+            if only_head {
+                let text = session
+                    .get_text(NETWR_ID)
+                    .map_err(|e| format!("读取抬头净值失败: {e}"))?;
+                Ok(parse_amount(&text))
+            } else {
+                read_price_total(session).map_err(|e| format!("读取定价合计失败: {e}"))
+            }
+        };
+
+        match one() {
+            Ok(amount) => {
+                logger::info(app, &format!("订单 {order_no} 金额: {amount}"));
+                results.push((order_no.clone(), amount, String::new()));
+                emit_progress(app, idx, order_no, amount, "");
+            }
+            Err(e) => {
+                logger::error(app, &format!("订单 {order_no} 查询失败: {e}"));
+                results.push((order_no.clone(), 0.0, e.clone()));
+                emit_progress(app, idx, order_no, 0.0, &e);
+            }
+        }
+        let _ = session.send_vkey(3);
+    }
+    let _ = session.send_vkey(3);
+    Ok(results)
 }
 
 /// 读取集合 Count 属性（不抛错，失败返回 0）
@@ -249,10 +373,10 @@ pub fn change_out_bound_delivery(
                 wait_sap(session, 5.0)?;
                 if is_save {
                     session.find_by_id("wnd[0]/tbar[0]/btn[11]")?.call("press", vec![])?; // SAVE
-                    output_info.push(format!("{material} Date:{proce_date} 修改ZPZ3完成"));
+                    output_info.push(format!("{material} {proce_date} 修改ZPZ3完成"));
                 }
                 else {
-                    output_info.push(format!("{material} Date:{proce_date} 修改ZPZ3完成(未保存)"));
+                    output_info.push(format!("{material} {proce_date} 修改ZPZ3完成(未保存)"));
                 }
                 break;
             }
@@ -308,10 +432,10 @@ pub fn change_out_bound_delivery(
                 wait_sap(session, 5.0)?;
                 if is_save {
                     session.find_by_id("wnd[0]/tbar[0]/btn[11]")?.call("press", vec![])?; // SAVE
-                    output_info.push(format!("{material} Date:{today} 新增ZPZ3完成"));
+                    output_info.push(format!("{material} {today} 新增ZPZ3完成"));
                 }
                 else {
-                    output_info.push(format!("{material} Date:{today} 新增ZPZ3完成(未保存)"));
+                    output_info.push(format!("{material} {today} 新增ZPZ3完成(未保存)"));
                 }
             } else {
                 output_info.push(format!("{material} 新增ZPZ3失败"));

@@ -6,10 +6,12 @@ mod sap_ops;
 
 use std::sync::Mutex;
 
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
 use sap_com::{cleanup_com, connect_sap_gui, get_session, list_sessions, wait_sap, Session};
-use sap_ops::{change_out_bound_delivery, get_customer_credit_info, get_order_amount};
+use sap_ops::{
+    change_out_bound_delivery, get_customer_credit_info, get_order_amount, get_order_amounts,
+};
 
 /// 全局状态：记录当前是否正在执行操作（防止并发操作 SAP 会话）
 struct BusyState(Mutex<bool>);
@@ -67,15 +69,49 @@ fn query_credit(app: AppHandle, state: State<'_, BusyState>, customer_code: Stri
 
 /// 订单金额批量查询（单个订单）
 #[tauri::command]
-fn query_order_amount(app: AppHandle, state: State<'_, BusyState>, order_no: String, only_head: bool, conn_idx: i32, sess_idx: i32) -> Result<f64, String> {
+fn query_order_amount(app: AppHandle, state: State<'_, BusyState>, order_no: String, only_head: bool, is_last: bool, conn_idx: i32, sess_idx: i32) -> Result<f64, String> {
     if !state.try_lock() {
         return Err("上一个操作还在执行，请等待完成".to_string());
     }
     let result = run_with_session(&app, conn_idx, sess_idx, |session| {
-        get_order_amount(&app, session, &order_no, only_head)
+        get_order_amount(&app, session, &order_no, only_head, is_last)
     });
     state.unlock();
     result
+}
+
+/// 订单金额批量查询（只进入一次 VA03，在事务内逐个切换订单号）
+///
+/// 必须走 async + spawn_blocking：同步命令会阻塞 WebView 主线程，后端每单 emit 的
+/// `order-amount://progress` 事件只能堆到整批结束才被处理，前端依然无法逐单刷新。
+/// BusyState 改为从 AppHandle 取，避开 `State<'_, _>` 参数跨 await 的生命周期限制。
+#[tauri::command]
+async fn query_order_amounts(
+    app: AppHandle,
+    order_nos: Vec<String>,
+    only_head: bool,
+    conn_idx: i32,
+    sess_idx: i32,
+) -> Result<Vec<(String, f64, String)>, String> {
+    let state = app.state::<BusyState>();
+    if !state.try_lock() {
+        return Err("上一个操作还在执行，请等待完成".to_string());
+    }
+    let task_app = app.clone();
+    let joined = tauri::async_runtime::spawn_blocking(move || {
+        run_with_session(&task_app, conn_idx, sess_idx, |session| {
+            get_order_amounts(&task_app, session, &order_nos, only_head)
+        })
+    })
+    .await;
+    state.unlock();
+    match joined {
+        Ok(result) => result,
+        Err(e) => {
+            logger::error(&app, &format!("批量查询任务异常结束: {e}"));
+            Err(format!("任务执行失败: {e}"))
+        }
+    }
 }
 
 /// 修改外向交货单
@@ -143,6 +179,7 @@ pub fn run() {
             refresh_sessions,
             query_credit,
             query_order_amount,
+            query_order_amounts,
             modify_delivery,
             get_log_dir,
             export_csv,

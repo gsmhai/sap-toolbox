@@ -26,8 +26,10 @@ function currentSession(): { connIdx: number; sessIdx: number } {
 const customerCode = ref("");
 const orderIds = ref("");
 const onlyHead = ref(true);
+const batchMode = ref(false); // 调试用：切换"单次进入 VA03 批量查询"与"逐条进入 VA03 查询"
 const orderRows = ref<Array<{ orderId: string; amount: string }>>([]);
-const orderSummary = ref("");
+const orderCount = ref(0);
+const orderTotal = ref(0);
 
 const deliveryId = ref("");
 const autoSave = ref(true);
@@ -185,6 +187,13 @@ function fmt(n: number): string {
   return n.toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
+// 让出一次宏任务，使浏览器有机会完成一帧绘制。
+// 单条模式里每次 await invoke 都会阻塞主线程执行 SAP 操作，若不主动让出，
+// 界面更新会被压到整批结束才绘制，表现为"合计/订单行迟迟不刷新"。
+function yieldPaint(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
 // ---------- 订单金额批量查询 ----------
 async function runOrders() {
   const ids = orderIds.value
@@ -196,28 +205,107 @@ async function runOrders() {
     return;
   }
   busy.value = true;
+  const t0 = performance.now();
+  const modeLabel = batchMode.value ? "批量·单次VA03" : "单条·逐条VA03";
   orderRows.value = ids.map((orderId) => ({ orderId, amount: "查询中..." }));
+  orderCount.value = 0;
+  orderTotal.value = 0;
+  // 先让 UI 把"0"和"查询中..."画出来，再进入耗时的 SAP 调用
+  await yieldPaint();
   let total = 0;
   let count = 0;
 
-  for (const id of ids) {
-    try {
-      const val = await invoke<number>("query_order_amount", {
-        orderNo: id,
-        onlyHead: onlyHead.value,
-        connIdx: currentSession().connIdx,
-        sessIdx: currentSession().sessIdx,
-      });
-      const row = orderRows.value.find((r) => r.orderId === id && r.amount === "查询中...");
-      if (row) row.amount = fmt(val);
-      total += val;
-      count++;
-    } catch (e) {
-      const row = orderRows.value.find((r) => r.orderId === id && r.amount === "查询中...");
-      if (row) row.amount = `ERROR: ${e}`;
+  try {
+    if (batchMode.value) {
+      // 只进入一次 VA03，在事务内逐个切换订单号。
+      // 后端每完成一单就 emit 进度事件，这里实时回填该行与合计；
+      // 最终的 invoke 返回值只做一次精确覆盖，避免事件丢失或重复累加。
+      let stopped = false;
+      const unlisten = await listen<{ index: number; orderNo: string; amount: number; error: string }>(
+        "order-amount://progress",
+        (ev) => {
+          const p = ev.payload;
+          const row = orderRows.value[p.index];
+          if (row) row.amount = p.error ? `ERROR: ${p.error}` : fmt(p.amount);
+          if (!p.error) {
+            total += p.amount;
+            count++;
+          }
+          orderCount.value = count;
+          orderTotal.value = total;
+        },
+      );
+      const stop = () => {
+        if (stopped) return;
+        stopped = true;
+        unlisten();
+      };
+      try {
+        const res = await invoke<Array<[string, number, string]>>("query_order_amounts", {
+          orderNos: ids,
+          onlyHead: onlyHead.value,
+          connIdx: currentSession().connIdx,
+          sessIdx: currentSession().sessIdx,
+        });
+        stop(); // 先解除监听，避免迟到事件覆盖最终值
+        // 按下标回填（与输入顺序一一对应），并重算合计得到精确值
+        count = 0;
+        total = 0;
+        res.forEach(([orderId, val, err], i) => {
+          const row = orderRows.value[i];
+          if (!row) return;
+          if (err) {
+            row.amount = `ERROR: ${err}`;
+            appendLog({ time: now(), level: "ERROR", message: `订单 ${orderId} 失败: ${err}` });
+          } else {
+            row.amount = fmt(val);
+            total += val;
+            count++;
+          }
+        });
+        orderCount.value = count;
+        orderTotal.value = total;
+      } finally {
+        stop();
+      }
+    } else {
+      // 原方案：每个订单号都重新进入一次 VA03（按下标回填，避免重复订单号错位）
+      for (let k = 0; k < ids.length; k++) {
+        const id = ids[k];
+        try {
+          const val = await invoke<number>("query_order_amount", {
+            orderNo: id,
+            onlyHead: onlyHead.value,
+            isLast: k === ids.length - 1,
+            connIdx: currentSession().connIdx,
+            sessIdx: currentSession().sessIdx,
+          });
+          const row = orderRows.value[k];
+          if (row) row.amount = fmt(val);
+          total += val;
+          count++;
+        } catch (e) {
+          const row = orderRows.value[k];
+          if (row) row.amount = `ERROR: ${e}`;
+        }
+        // 每处理完一条就刷新合计与订单行，并让出一帧真正绘制到界面
+        orderCount.value = count;
+        orderTotal.value = total;
+        await yieldPaint();
+      }
     }
+  } catch (e) {
+    appendLog({ time: now(), level: "ERROR", message: `批量查询失败: ${e}` });
   }
-  orderSummary.value = `合计（共 ${count} 个 Order ID）：${fmt(total)}`;
+
+  const elapsed = (performance.now() - t0) / 1000;
+  orderCount.value = count;
+  orderTotal.value = total;
+  appendLog({
+    time: now(),
+    level: "INFO",
+    message: `订单查询完成 [${modeLabel}]，${count} 个，耗时 ${elapsed.toFixed(2)} 秒`,
+  });
   busy.value = false;
 }
 
@@ -384,6 +472,10 @@ onMounted(async () => {
               ></textarea>
             </div>
             <div class="btn-col">
+              <label class="checkbox mode-toggle" title="切换：批量=只进入一次 VA03 逐个切换订单号；单条=每个订单号都重新进入 VA03">
+                <input type="checkbox" v-model="batchMode" />
+                批量模式
+              </label>
               <button class="btn primary" :disabled="busy" @click="runOrders">批量查询金额</button>
               <button class="btn small" :disabled="orderRows.length === 0" @click="copyText(orderTableText(), '订单表格')">复制表格</button>
               <button class="btn small" :disabled="orderRows.length === 0" @click="exportOrders">导出 CSV</button>
@@ -398,12 +490,12 @@ onMounted(async () => {
                     <td>{{ row.orderId }}</td>
                     <td>{{ row.amount }}</td>
                   </tr>
-                  <tr v-if="orderRows.length > 0" class="summary">
-                    <td class="bold red">{{ orderSummary }}</td>
-                    <td class="bold red"></td>
-                  </tr>
                   <tr v-if="orderRows.length === 0" class="placeholder-row">
                     <td colspan="2" class="empty">（未查询）</td>
+                  </tr>
+                  <tr class="summary">
+                    <td class="bold red">合计（共 {{ orderCount }} 个）</td>
+                    <td class="bold red">{{ fmt(orderTotal) }}</td>
                   </tr>
                 </tbody>
               </table>
@@ -792,6 +884,10 @@ body {
   gap: 8px;
   width: 124px;
   flex-shrink: 0;
+}
+
+.mode-toggle {
+  align-self: flex-start;
 }
 
 /* ===== 表格 ===== */
