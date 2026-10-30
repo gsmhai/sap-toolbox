@@ -42,23 +42,49 @@ impl Disp {
         Disp { ptr }
     }
 
-    /// 核心动态调用
+    /// 核心动态调用（按名称解析 DISPID 后调用）
     fn invoke(&self, flags: DISPATCH_FLAGS, name: &str, args: Vec<VARIANT>) -> Result<VARIANT, String> {
         unsafe {
             let name_h = windows::core::HSTRING::from(name);
             let name_pcwstr = PCWSTR::from_raw(name_h.as_ptr());
 
             let mut dispid: i32 = 0;
-            self.ptr
-                .GetIDsOfNames(
-                    &GUID::default(),
-                    &name_pcwstr,
-                    1,
-                    0,
-                    &mut dispid,
-                )
-                .map_err(|e| format!("GetIDsOfNames({name}) 失败: {e}"))?;
 
+            // 1) 标准路径：IDispatch::GetIDsOfNames
+            let mut resolved = self
+                .ptr
+                .GetIDsOfNames(&GUID::default(), &name_pcwstr, 1, 0, &mut dispid);
+
+            // 2) 回退路径：ITypeInfo::GetIDsOfNames（typelib）。
+            //    SAP 部分对象（如表格上的 GetCell）的 IDispatch::GetIDsOfNames 会对某些成员
+            //    返回 E_NOTIMPL(0x80004001)，但其 typelib 路径正常解析。
+            //    pywin32 也是优先走 typelib（dynamic.py 的 mapFuncs / _LazyAddAttr_），这里对齐该行为。
+            if resolved.is_err() {
+                if let Ok(type_info) = self.ptr.GetTypeInfo(0, 0) {
+                    if type_info
+                        .GetIDsOfNames(&name_pcwstr, 1, &mut dispid)
+                        .is_ok()
+                    {
+                        resolved = Ok(());
+                    }
+                }
+            }
+
+            resolved.map_err(|e| format!("GetIDsOfNames({name}) 失败: {e}"))?;
+
+            self.invoke_dispid(flags, dispid, args)
+                .map_err(|e| format!("调用 {name} 失败: {e}"))
+        }
+    }
+
+    /// 直接按 DISPID 调用（跳过名称解析，用于默认成员 DISPID_VALUE 等场景）
+    fn invoke_dispid(
+        &self,
+        flags: DISPATCH_FLAGS,
+        dispid: i32,
+        args: Vec<VARIANT>,
+    ) -> Result<VARIANT, String> {
+        unsafe {
             // 参数逆序（COM 约定 rgvarg[0] 是最后一个参数）
             // 注意：DISPPARAMS.rgvarg 类型为 *mut VARIANT（VARIANTARG 即 VARIANT）
             let mut vargs: Vec<VARIANT> = args.into_iter().rev().collect();
@@ -91,7 +117,7 @@ impl Disp {
                     None,
                     None,
                 )
-                .map_err(|e| format!("调用 {name} 失败: {e}"))?;
+                .map_err(|e| format!("Invoke(dispid={dispid}) 失败: {e}"))?;
             Ok(result)
         }
     }
@@ -135,10 +161,15 @@ impl Disp {
     }
 
     /// 集合索引访问：Children(i) / Columns(i) / Rows(i)
+    ///
+    /// SAP 集合对象通过 COM 默认成员（DISPID_VALUE = 0）做索引访问，
+    /// 等价于 pywin32 的 `Children(0)`（其 __call__ 用 DISPID_VALUE 直接 Invoke）。
+    /// 优先走默认成员，失败再回退命名成员 "Item"。
     pub fn item(&self, index: i32) -> Result<Disp, String> {
+        let arg = i32_variant(index);
         let v = self
-            .call("Item", vec![i32_variant(index)])
-            .or_else(|_| self.call("item", vec![i32_variant(index)]))?;
+            .invoke_dispid(DISPATCH_METHOD | DISPATCH_PROPERTYGET, 0, vec![arg.clone()])
+            .or_else(|_| self.call("Item", vec![arg]))?;
         variant_to_disp(&v)
     }
 }
@@ -255,14 +286,18 @@ fn get_collection_count(d: &Disp) -> Result<i32, String> {
 
 /// 列举所有会话
 pub fn list_sessions(app: &Disp) -> Result<Vec<(i32, i32, String)>, String> {
-    let conn_count = get_collection_count(app)?;
+    // GuiApplication.Children -> GuiConnection 集合
+    let conns = app.get_disp("Children")?;
+    let conn_count = get_collection_count(&conns)?;
     let mut out = Vec::new();
     for i in 0..conn_count {
-        let conn = app.item(i)?;
+        let conn = conns.item(i)?;
         let desc_prefix = conn.get_str("ConnectionString").unwrap_or_default();
-        let sess_count = get_collection_count(&conn)?;
+        // GuiConnection.Children -> GuiSession 集合
+        let sesses = conn.get_disp("Children")?;
+        let sess_count = get_collection_count(&sesses)?;
         for j in 0..sess_count {
-            let sess = conn.item(j)?;
+            let sess = sesses.item(j)?;
             let desc = match sess.get_disp("Info") {
                 Ok(info) => {
                     let sys = info.get_str("SystemName").unwrap_or_default();
@@ -285,8 +320,17 @@ pub fn list_sessions(app: &Disp) -> Result<Vec<(i32, i32, String)>, String> {
 
 /// 获取指定会话
 pub fn get_session(app: &Disp, conn_idx: i32, sess_idx: i32) -> Result<Disp, String> {
-    let conn = app.item(conn_idx).map_err(|e| format!("连接 {conn_idx} 不存在: {e}"))?;
-    conn.item(sess_idx)
+    let conns = app
+        .get_disp("Children")
+        .map_err(|e| format!("无法获取连接集合: {e}"))?;
+    let conn = conns
+        .item(conn_idx)
+        .map_err(|e| format!("连接 {conn_idx} 不存在: {e}"))?;
+    let sesses = conn
+        .get_disp("Children")
+        .map_err(|e| format!("无法获取会话集合: {e}"))?;
+    sesses
+        .item(sess_idx)
         .map_err(|e| format!("会话 {sess_idx} 不存在: {e}"))
 }
 
@@ -311,7 +355,10 @@ impl Session {
     }
 
     pub fn send_vkey(&self, key: i32) -> Result<(), String> {
-        self.disp.call("sendVKey", vec![i32_variant(key)])?;
+        // sendVKey 是窗口对象（wnd[0]）的方法，不是 GuiSession 的方法。
+        // 等价于 test.py 的 session.findById("wnd[0]").sendVKey(0)
+        let wnd = self.find_by_id("wnd[0]")?;
+        wnd.call("sendVKey", vec![i32_variant(key)])?;
         Ok(())
     }
 
@@ -346,6 +393,14 @@ impl Session {
         let el = self.find_by_id(id)?;
         let v = str_variant(value);
         el.set("text", v.clone()).or_else(|_| el.set("Text", v))
+    }
+
+    /// 设置下拉框（GuiComboBox）的 key 值
+    /// 等价于 test.py 的 session.findById(id).key = value（下拉框用 key 而非 text）
+    pub fn set_key(&self, id: &str, value: &str) -> Result<(), String> {
+        let el = self.find_by_id(id)?;
+        let v = str_variant(value);
+        el.set("key", v.clone()).or_else(|_| el.set("Key", v))
     }
 }
 

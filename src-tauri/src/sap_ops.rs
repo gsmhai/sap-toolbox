@@ -189,12 +189,17 @@ pub fn change_out_bound_delivery(
     let output_table_id = r"wnd[0]/usr/tblSAPDV70ATC_NAST3";
 
     let mut output_info: Vec<String> = Vec::new();
-    let delivery_table = session.find_by_id(delivery_table_id)?;
+    let mut delivery_table = session.find_by_id(delivery_table_id)?;
 
     let rows = delivery_table.get_disp("Rows")?;
     let row_count = collection_count(&rows);
 
     for i in 0..row_count {
+        // 每次迭代重新获取表格：上一轮末尾的 BACK / press / select 会重建界面，
+        // 旧的 COM 引用会失效，再调用其 GetCell 会返回 E_NOTIMPL(0x80004001)。
+        // test.py 也在每次循环末尾重新 findById(deliveryTableId)。
+        delivery_table = session.find_by_id(delivery_table_id)?;
+
         let material = get_cell_text(&delivery_table, i, 1)?;
         if material.is_empty() {
             break;
@@ -239,7 +244,7 @@ pub fn change_out_bound_delivery(
                 select_row(&output_table, j)?;
                 session.find_by_id("wnd[0]/tbar[1]/btn[5]")?.call("press", vec![])?; // Further data
                 wait_sap(session, 5.0)?;
-                session.set_text("wnd[0]/usr/cmbNAST-VSZTP", "4")?;
+                session.set_key("wnd[0]/usr/cmbNAST-VSZTP", "4")?;
                 session.find_by_id("wnd[0]/tbar[0]/btn[3]")?.call("press", vec![])?; // BACK
                 wait_sap(session, 5.0)?;
                 if is_save {
@@ -298,7 +303,7 @@ pub fn change_out_bound_delivery(
                 select_row(&output_table, yellow_row)?;
                 session.find_by_id("wnd[0]/tbar[1]/btn[5]")?.call("press", vec![])?; // Further data
                 wait_sap(session, 5.0)?;
-                session.set_text("wnd[0]/usr/cmbNAST-VSZTP", "4")?;
+                session.set_key("wnd[0]/usr/cmbNAST-VSZTP", "4")?;
                 session.find_by_id("wnd[0]/tbar[0]/btn[3]")?.call("press", vec![])?; // BACK
                 wait_sap(session, 5.0)?;
                 if is_save {
