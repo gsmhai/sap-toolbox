@@ -10,7 +10,8 @@ use tauri::{AppHandle, Manager, State};
 
 use sap_com::{cleanup_com, connect_sap_gui, get_session, list_sessions, wait_sap, Session};
 use sap_ops::{
-    change_out_bound_delivery, get_customer_credit_info, get_order_amount, get_order_amounts,
+    change_out_bound_delivery, get_customer_credit_info, get_delivery_output_info, get_order_amount,
+    get_order_amounts,
 };
 
 /// 全局状态：记录当前是否正在执行操作（防止并发操作 SAP 会话）
@@ -114,14 +115,27 @@ async fn query_order_amounts(
     }
 }
 
-/// 修改外向交货单
+/// 查询交货单输出信息（料号 + 描述）
 #[tauri::command]
-fn modify_delivery(app: AppHandle, state: State<'_, BusyState>, order_no: String, is_save: bool, conn_idx: i32, sess_idx: i32) -> Result<Vec<String>, String> {
+fn query_delivery_output(app: AppHandle, state: State<'_, BusyState>, order_no: String, conn_idx: i32, sess_idx: i32) -> Result<Vec<(String, String)>, String> {
     if !state.try_lock() {
         return Err("上一个操作还在执行，请等待完成".to_string());
     }
     let result = run_with_session(&app, conn_idx, sess_idx, |session| {
-        change_out_bound_delivery(&app, session, &order_no, is_save)
+        get_delivery_output_info(&app, session, &order_no)
+    });
+    state.unlock();
+    result
+}
+
+/// 修改外向交货单（每次处理一行物料）
+#[tauri::command]
+fn modify_delivery(app: AppHandle, state: State<'_, BusyState>, order_no: String, is_create: bool, lang: String, is_save: bool, row_index: i32, conn_idx: i32, sess_idx: i32) -> Result<String, String> {
+    if !state.try_lock() {
+        return Err("上一个操作还在执行，请等待完成".to_string());
+    }
+    let result = run_with_session(&app, conn_idx, sess_idx, |session| {
+        change_out_bound_delivery(&app, session, &order_no, is_create, &lang, is_save, row_index)
     });
     state.unlock();
     result
@@ -180,6 +194,7 @@ pub fn run() {
             query_credit,
             query_order_amount,
             query_order_amounts,
+            query_delivery_output,
             modify_delivery,
             get_log_dir,
             export_csv,

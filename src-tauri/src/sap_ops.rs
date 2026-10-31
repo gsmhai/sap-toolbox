@@ -29,6 +29,10 @@ const BT_HEAD_ID: &str = "wnd[0]/usr/subSUBSCREEN_HEADER:SAPMV45A:4021/btnBT_HEA
 const SBAR_ID: &str = "wnd[0]/sbar";
 /// SAP 信息弹窗文本
 const MSG_TXT_ID: &str = "wnd[1]/usr/txtMESSTXT1";
+/// VL02N 交货单明细表
+const DELIVERY_TABLE_ID: &str = r"wnd[0]/usr/tabsTAXI_TABSTRIP_OVERVIEW/tabpT\01/ssubSUBSCREEN_BODY:SAPMV50A:1102/tblSAPMV50ATC_LIPS_OVER";
+/// VL02N 输出表 (ZPZ3)
+const OUTPUT_TABLE_ID: &str = r"wnd[0]/usr/tblSAPDV70ATC_NAST3";
 
 /// 读取状态栏/弹窗提示（读不到就返回空串，不抛错）
 fn read_status_text(session: &Session, id: &str) -> String {
@@ -424,70 +428,61 @@ fn select_row(table: &Disp, row: i32) -> Result<(), String> {
     r.set("selected", bool_variant(true))
 }
 
-/// ③ 修改外向交货单输出 ZPZ3 (VL02N)
-pub fn change_out_bound_delivery(
-    app: &AppHandle,
-    session: &Session,
-    order_no: &str,
-    is_save: bool,
-) -> Result<Vec<String>, String> {
-    logger::info(app, &format!("VL02N 修改外向交货单输出 ZPZ3: {order_no} (isSave={is_save}) ..."));
-    if order_no.trim().is_empty() {
-        return Ok(vec!["交货单号为空".to_string()]);
-    }
+/// 进入 VL02N 交货单页面（等价于 Python EnterDeliveryPage）。
+/// 成功返回交货单明细表；失败返回错误信息（"XX 不存在" / "XX 获取表异常"）。
+fn enter_delivery_page(app: &AppHandle, session: &Session, order_no: &str) -> Result<Disp, String> {
     session.maximize()?;
     session.start_transaction("VL02N")?;
     wait_sap(session, 5.0)?;
     session.set_text("wnd[0]/usr/ctxtLIKP-VBELN", order_no)?;
     session.send_vkey(0)?;
     wait_sap(session, 5.0)?;
-
-    let delivery_table_id = r"wnd[0]/usr/tabsTAXI_TABSTRIP_OVERVIEW/tabpT\01/ssubSUBSCREEN_BODY:SAPMV50A:1102/tblSAPMV50ATC_LIPS_OVER";
-    let output_table_id = r"wnd[0]/usr/tblSAPDV70ATC_NAST3";
-
-    let mut output_info: Vec<String> = Vec::new();
-    // 防护：交货单号非法（不存在）时明细表格读不到，SAP 会在状态栏提示
-    let mut delivery_table = match session.find_by_id(delivery_table_id) {
-        Ok(t) => t,
+    match session.find_by_id(DELIVERY_TABLE_ID) {
+        Ok(t) => Ok(t),
         Err(e) => {
             let status = read_status_text(session, SBAR_ID);
             let low = status.to_lowercase();
             let _ = session.send_vkey(3); // BACK 退出 VL02N（与 Python 一致）
-            // 与 Python ChangeOutBoundDelivery 一致：状态栏含 "not exist" 即视为交货单不存在
             if low.contains("not exist") {
-                let msg = format!("{order_no} 不存在");
-                logger::warn(app, &format!("VL02N {msg}（状态栏: {status}）"));
-                return Ok(vec![msg]);
+                logger::warn(app, &format!("VL02N {order_no} 不存在（状态栏: {status}）"));
+                Err(format!("{order_no} 不存在"))
+            } else {
+                logger::error(app, &format!("VL02N 读取交货单表格失败: {e}；状态栏: {status}"));
+                Err(format!("{order_no} 获取表异常"))
             }
-            let msg = format!("{order_no} 获取表异常");
-            logger::error(app, &format!("VL02N 读取交货单表格失败: {e}；状态栏: {status}"));
-            return Ok(vec![msg]);
         }
-    };
+    }
+}
+
+/// ⑤ 查询交货单输出信息 (VL02N)，返回 [(料号, 描述), ...]。
+/// 等价于 Python GetDeliveryOutputInfo。结束后不退出 VL02N，页面保持打开，
+/// 供后续"选择修改 / 修改运单"（isCreate=false）复用。
+pub fn get_delivery_output_info(
+    app: &AppHandle,
+    session: &Session,
+    order_no: &str,
+) -> Result<Vec<(String, String)>, String> {
+    logger::info(app, &format!("VL02N 查询交货单输出信息: {order_no} ..."));
+    if order_no.trim().is_empty() {
+        return Err("交货单号为空".to_string());
+    }
+    let mut delivery_table = enter_delivery_page(app, session, order_no)?;
 
     let max_row = delivery_table.get_i32("RowCount").unwrap_or(0);
     let mut visible_row = delivery_table
         .get_i32("VisibleRowCount")
         .unwrap_or(max_row.max(1));
     let mut row: i32 = 0;
+    let mut material_list: Vec<(String, String)> = Vec::new();
 
     for i in 0..max_row {
-        // 每次迭代重新获取表格：上一轮末尾的 BACK / press / select 会重建界面，
-        // 旧的 COM 引用会失效，再调用其 GetCell 会返回 E_NOTIMPL(0x80004001)。
-        // test.py 也在每次循环末尾重新 findById(deliveryTableId)。
-        delivery_table = session.find_by_id(delivery_table_id)?;
-
-        // 先判断是否需要滚动（与 Python 一致：i >= visualRow 时滚到 i-1），
-        // 再用滚动条实际 position 计算本行在视口中的相对位置（不夹紧时为 0）。
+        delivery_table = session.find_by_id(DELIVERY_TABLE_ID)?;
         if i >= visible_row {
             let scrollbar = delivery_table.get_disp("verticalScrollbar")?;
             scrollbar.set("position", i32_variant(i - 1))?;
             wait_sap(session, 5.0)?;
-            delivery_table = session.find_by_id(delivery_table_id)?;
+            delivery_table = session.find_by_id(DELIVERY_TABLE_ID)?;
             visible_row += delivery_table.get_i32("VisibleRowCount").unwrap_or(0);
-            // 回读实际位置（对应 Python 的 "Scroll to ... fail" 分支）：
-            // 被夹紧时 row=0 会与期望绝对行错位（某行重复处理、另一行漏处理），
-            // 用实际 pos 反算相对行。
             let actual_pos = delivery_table
                 .get_disp("verticalScrollbar")
                 .and_then(|sb| sb.get_i32("position"))
@@ -506,100 +501,181 @@ pub fn change_out_bound_delivery(
                 row = 0;
             }
         }
-
-        // 读取当前可见行；下面 select 用的是同一个 row（修复旧版"读 N 行、选 N+1 行"的错位）
         let material = get_cell_text(&delivery_table, row, 1)?;
         if material.is_empty() {
             logger::info(app, "All order set output");
             break;
         }
-        select_row(&delivery_table, row)?;
-        row += 1; // 选中后再前进到下一行
+        let description = get_cell_text(&delivery_table, row, 4)?;
+        material_list.push((material, description));
+        row += 1;
+    }
 
-        // 菜单：输出
-        session
-            .find_by_id("wnd[0]/mbar/menu[3]/menu[2]/menu[1]")?
-            .call("select", vec![])?;
+    logger::info(app, &format!("VL02N 查询返回 {} 个物料", material_list.len()));
+    Ok(material_list)
+}
+
+/// ③ 修改外向交货单输出 ZPZ3 (VL02N) —— 每次只处理一个物料行。
+/// is_create: 是否重新进入 VL02N（首行 true，后续复用已打开页面时 false）。
+/// lang: 语言（ZH 不设置语言列；非 ZH 时把语言列设为 EN）。
+/// row_index: 要处理的物料行在交货单表中的绝对下标（与"查询运单"返回顺序一致）。
+pub fn change_out_bound_delivery(
+    app: &AppHandle,
+    session: &Session,
+    order_no: &str,
+    is_create: bool,
+    lang: &str,
+    is_save: bool,
+    row_index: i32,
+) -> Result<String, String> {
+    logger::info(
+        app,
+        &format!(
+            "VL02N 修改交货单 {order_no} 第{}行 (isCreate={is_create}, lang={lang}, isSave={is_save}) ...",
+            row_index + 1
+        ),
+    );
+    if order_no.trim().is_empty() {
+        return Err("交货单号为空".to_string());
+    }
+
+    // 获取交货单明细表：is_create 重新进入；否则复用已打开页面，找不到再进入（与 Python 一致）
+    let mut delivery_table = if is_create {
+        enter_delivery_page(app, session, order_no)?
+    } else {
+        match session.find_by_id(DELIVERY_TABLE_ID) {
+            Ok(t) => t,
+            Err(_) => enter_delivery_page(app, session, order_no)?,
+        }
+    };
+
+    // 定位到绝对行 row_index。
+    // 每次调用都是独立的 SAP 操作，滚动条当前位置未知（可能被上次"查询运单"滚到中间），
+    // 因此统一用绝对 position 定位：row_index=0 时拉回顶部，否则滚到 row_index-1 使目标行置顶。
+    let mut row: i32 = 0;
+    if row_index <= 0 {
+        let _ = delivery_table
+            .get_disp("verticalScrollbar")
+            .map(|sb| sb.set("position", i32_variant(0)));
         wait_sap(session, 5.0)?;
-
-        let mut output_table = session.find_by_id(output_table_id)?;
-
-        let mut zpz3_list: Vec<(String, String, String)> = Vec::new();
-        let mut end_row: i32 = 0;
-        let mut need_create = true;
-
-        let visible_count = output_table
-            .get_i32("VisibleRowCount")
-            .map(|c| c.abs())
-            .unwrap_or(0);
-
-        for j in 0..visible_count {
-            let status = get_cell_icon(&output_table, j, 0)?;
-            let out_type = get_cell_text(&output_table, j, 1)?;
-            let proce_date = get_cell_text(&output_table, j, 8)?;
-            let proce_time = get_cell_text(&output_table, j, 9)?;
-
-            if out_type == "ZPZ3" {
-                zpz3_list.push((status.clone(), proce_date.clone(), proce_time.clone()));
-            }
-            if out_type == "ZPZ3" && status == "S_TL_Y" {
-                logger::info(app, &format!("找到需修改的 ZPZ3，行: {j}"));
-                need_create = false;
-                select_row(&output_table, j)?;
-                session.find_by_id("wnd[0]/tbar[1]/btn[2]")?.call("press", vec![])?; // Communication
-                wait_sap(session, 5.0)?;
-                session.set_text("wnd[0]/usr/ctxtNAST-LDEST", "MAIL")?;
-                session.find_by_id("wnd[0]/tbar[0]/btn[3]")?.call("press", vec![])?; // BACK
-                wait_sap(session, 5.0)?;
-                output_table = session.find_by_id(output_table_id)?;
-                select_row(&output_table, j)?;
-                session.find_by_id("wnd[0]/tbar[1]/btn[5]")?.call("press", vec![])?; // Further data
-                wait_sap(session, 5.0)?;
-                session.set_key("wnd[0]/usr/cmbNAST-VSZTP", "4")?;
-                session.find_by_id("wnd[0]/tbar[0]/btn[3]")?.call("press", vec![])?; // BACK
-                wait_sap(session, 5.0)?;
-                if is_save {
-                    session.find_by_id("wnd[0]/tbar[0]/btn[11]")?.call("press", vec![])?; // SAVE
-                    output_info.push(format!("{material} {proce_date} 修改ZPZ3完成"));
-                }
-                else {
-                    output_info.push(format!("{material} {proce_date} 修改ZPZ3完成(未保存)"));
-                }
-                break;
-            }
-            if out_type.is_empty() || status.is_empty() {
-                end_row = j;
-                logger::info(app, &format!("最后一行: {end_row}，最大可见行: {visible_count}"));
-                break;
-            }
+        delivery_table = session.find_by_id(DELIVERY_TABLE_ID)?;
+    } else {
+        let scrollbar = delivery_table.get_disp("verticalScrollbar")?;
+        scrollbar.set("position", i32_variant(row_index - 1))?;
+        wait_sap(session, 5.0)?;
+        delivery_table = session.find_by_id(DELIVERY_TABLE_ID)?;
+        let actual_pos = delivery_table
+            .get_disp("verticalScrollbar")
+            .and_then(|sb| sb.get_i32("position"))
+            .unwrap_or(-1);
+        if actual_pos != row_index - 1 {
+            logger::warn(
+                app,
+                &format!(
+                    "滚动到 {} 失败，当前滚动条位置: {}（按实际位置修正相对行）",
+                    row_index - 1,
+                    actual_pos
+                ),
+            );
+            row = row_index - (actual_pos + 1);
+        } else {
+            row = 0;
         }
+    }
 
-        logger::info(app, &format!("ZPZ3 列表: {:?}", zpz3_list));
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-        let today_date = chrono::Local::now().date_naive();
-        let mut existing_time: Option<String> = None; // 保存已存在 ZPZ3 的完整时间(YYYY-MM-DD HH:MM:SS)，供日志打印
-        for (status, pro_date, pro_time) in &zpz3_list {
-            let within_days = match chrono::NaiveDate::parse_from_str(pro_date, "%Y-%m-%d") {
-                Ok(d) => (today_date - d).num_days().abs() <= 3,
-                Err(_) => {
-                    logger::warn(app, &format!("{material} ZPZ3 处理日期无法解析: {pro_date}"));
-                    false
-                }
+    let material = get_cell_text(&delivery_table, row, 1)?;
+    if material.is_empty() {
+        return Ok("没有可以执行的操作".to_string());
+    }
+    select_row(&delivery_table, row)?;
+
+    // 菜单：输出
+    session
+        .find_by_id("wnd[0]/mbar/menu[3]/menu[2]/menu[1]")?
+        .call("select", vec![])?;
+    wait_sap(session, 5.0)?;
+
+    let mut output_table = session.find_by_id(OUTPUT_TABLE_ID)?;
+
+    let mut zpz3_list: Vec<(String, String, String)> = Vec::new();
+    let mut end_row: i32 = 0;
+    let mut need_create = true;
+
+    let visible_count = output_table
+        .get_i32("VisibleRowCount")
+        .map(|c| c.abs())
+        .unwrap_or(0);
+
+    for j in 0..visible_count {
+        let status = get_cell_icon(&output_table, j, 0)?;
+        let out_type = get_cell_text(&output_table, j, 1)?;
+        let proce_date = get_cell_text(&output_table, j, 8)?;
+        let proce_time = get_cell_text(&output_table, j, 9)?;
+
+        if out_type == "ZPZ3" {
+            zpz3_list.push((status.clone(), proce_date.clone(), proce_time.clone()));
+        }
+        if out_type == "ZPZ3" && status == "S_TL_Y" {
+            logger::info(app, &format!("找到需修改的 ZPZ3，行: {j}"));
+            need_create = false;
+            select_row(&output_table, j)?;
+            session.find_by_id("wnd[0]/tbar[1]/btn[2]")?.call("press", vec![])?; // Communication
+            wait_sap(session, 5.0)?;
+            session.set_text("wnd[0]/usr/ctxtNAST-LDEST", "MAIL")?;
+            session.find_by_id("wnd[0]/tbar[0]/btn[3]")?.call("press", vec![])?; // BACK
+            wait_sap(session, 5.0)?;
+            output_table = session.find_by_id(OUTPUT_TABLE_ID)?;
+            select_row(&output_table, j)?;
+            session.find_by_id("wnd[0]/tbar[1]/btn[5]")?.call("press", vec![])?; // Further data
+            wait_sap(session, 5.0)?;
+            session.set_key("wnd[0]/usr/cmbNAST-VSZTP", "4")?;
+            session.find_by_id("wnd[0]/tbar[0]/btn[3]")?.call("press", vec![])?; // BACK
+            wait_sap(session, 5.0)?;
+            let result = if is_save {
+                session.find_by_id("wnd[0]/tbar[0]/btn[11]")?.call("press", vec![])?; // SAVE
+                format!("{material} {proce_date} 修改ZPZ3完成")
+            } else {
+                format!("{material} {proce_date} 修改ZPZ3完成(未保存)")
             };
-            if status == "S_TL_G" && within_days {
-                need_create = false;
-                let combined = fmt_sap_datetime(pro_date, pro_time);
-                existing_time = Some(combined.clone());
-                logger::info(app, &format!("{material} 3天内已设置 ZPZ3，时间: {combined}"));
-                break;
-            }
+            session.find_by_id("wnd[0]/tbar[0]/btn[3]")?.call("press", vec![])?; // BACK 回交货单
+            return Ok(result);
         }
+        if out_type.is_empty() || status.is_empty() {
+            end_row = j;
+            logger::info(app, &format!("最后一行: {end_row}，最大可见行: {visible_count}"));
+            break;
+        }
+    }
 
-        if need_create {
-            if let Err(e) = set_cell_text(&output_table, end_row, 1, "ZPZ3") {
-                logger::error(app, &format!("{material} 设置 ZPZ3 失败: {e}"));
-                output_info.push(format!("{material} 设置 ZPZ3 失败: {e}"));
-                break;
+    logger::info(app, &format!("ZPZ3 列表: {:?}", zpz3_list));
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let today_date = chrono::Local::now().date_naive();
+    let mut existing_time: Option<String> = None;
+    for (status, pro_date, pro_time) in &zpz3_list {
+        let within_days = match chrono::NaiveDate::parse_from_str(pro_date, "%Y-%m-%d") {
+            Ok(d) => (today_date - d).num_days().abs() <= 3,
+            Err(_) => {
+                logger::warn(app, &format!("{material} ZPZ3 处理日期无法解析: {pro_date}"));
+                false
+            }
+        };
+        if status == "S_TL_G" && within_days {
+            need_create = false;
+            let combined = fmt_sap_datetime(pro_date, pro_time);
+            existing_time = Some(combined.clone());
+            logger::info(app, &format!("{material} 3天内已设置 ZPZ3，时间: {combined}"));
+            break;
+        }
+    }
+
+    let result = if need_create {
+        if let Err(e) = set_cell_text(&output_table, end_row, 1, "ZPZ3") {
+            logger::error(app, &format!("{material} 设置 ZPZ3 失败: {e}"));
+            format!("{material} 设置 ZPZ3 失败: {e}")
+        } else {
+            // 语言列：非 ZH 时设为 EN（ZH 为默认，无需设置）
+            if lang != "ZH" {
+                let _ = set_cell_text(&output_table, end_row, 6, "EN");
             }
             select_row(&output_table, end_row)?;
             session.find_by_id("wnd[0]/tbar[1]/btn[2]")?.call("press", vec![])?; // Communication
@@ -608,7 +684,7 @@ pub fn change_out_bound_delivery(
             session.find_by_id("wnd[0]/tbar[0]/btn[3]")?.call("press", vec![])?; // BACK
             wait_sap(session, 5.0)?;
 
-            output_table = session.find_by_id(output_table_id)?;
+            output_table = session.find_by_id(OUTPUT_TABLE_ID)?;
             let yellow_row = find_yellow_zpz3_row(&output_table)?;
             if yellow_row >= 0 {
                 select_row(&output_table, yellow_row)?;
@@ -619,32 +695,26 @@ pub fn change_out_bound_delivery(
                 wait_sap(session, 5.0)?;
                 if is_save {
                     session.find_by_id("wnd[0]/tbar[0]/btn[11]")?.call("press", vec![])?; // SAVE
-                    output_info.push(format!("{material} {today} 新增ZPZ3完成"));
-                }
-                else {
-                    output_info.push(format!("{material} {today} 新增ZPZ3完成(未保存)"));
+                    format!("{material} {today} 新增ZPZ3完成")
+                } else {
+                    format!("{material} {today} 新增ZPZ3完成(未保存)")
                 }
             } else {
-                output_info.push(format!("{material} 新增ZPZ3失败"));
                 logger::warn(app, &format!("{material} 设置 Communication 后未找到黄色 ZPZ3"));
-                break;
+                format!("{material} 新增ZPZ3失败")
             }
-        } else {
-            let date_hint = existing_time
-                .as_deref()
-                .map(|d| format!("，时间：{d}"))
-                .unwrap_or_default();
-            logger::info(app, &format!("{material} 无需新增 ZPZ3 {date_hint}"));
         }
+    } else {
+        let date_hint = existing_time
+            .as_deref()
+            .map(|d| format!("，时间：{d}"))
+            .unwrap_or_default();
+        logger::info(app, &format!("{material} 无需新增 ZPZ3 {date_hint}"));
+        format!("{material} 无需新增 ZPZ3{date_hint}")
+    };
 
-        session.find_by_id("wnd[0]/tbar[0]/btn[3]")?.call("press", vec![])?; // BACK
-    }
-
-    if output_info.is_empty() {
-        output_info.push("没有找到可以执行任何 ZPZ3 的操作".to_string());
-    }
-    logger::info(app, &format!("结果: {:?}", output_info));
-    Ok(output_info)
+    session.find_by_id("wnd[0]/tbar[0]/btn[3]")?.call("press", vec![])?; // BACK 回交货单
+    Ok(result)
 }
 
 /// 查找黄色状态的 ZPZ3 行

@@ -33,7 +33,9 @@ const orderTotal = ref(0);
 
 const deliveryId = ref("");
 const autoSave = ref(true);
-const deliveryResult = ref("");
+const deliveryRows = ref<
+  Array<{ material: string; lang: "ZH" | "EN"; description: string; execute: boolean; result: string }>
+>([]);
 
 const busy = ref(false);
 
@@ -309,24 +311,110 @@ async function runOrders() {
   busy.value = false;
 }
 
-// ---------- 交货单修改 ----------
-async function runDelivery() {
+// ---------- 交货单：查询运单 / 选择修改 / 修改运单 ----------
+async function runQueryDelivery() {
   if (!deliveryId.value.trim()) {
     appendLog({ time: now(), level: "WARN", message: "请先输入 Delivery ID" });
     return;
   }
   busy.value = true;
-  deliveryResult.value = "执行中，请稍候...（SAP 界面会被自动操作，请勿手工点击）";
   try {
-    const res = await invoke<string[]>("modify_delivery", {
+    const res = await invoke<Array<[string, string]>>("query_delivery_output", {
       orderNo: deliveryId.value.trim(),
-      isSave: autoSave.value,
       connIdx: currentSession().connIdx,
       sessIdx: currentSession().sessIdx,
     });
-    deliveryResult.value = res.length > 0 ? res.join("\n") : "（无返回结果）";
+    deliveryRows.value = res.map(([material, description]) => ({
+      material,
+      description,
+      lang: "ZH" as const,
+      execute: true,
+      result: "",
+    }));
   } catch (e) {
-    deliveryResult.value = `错误: ${e}`;
+    deliveryRows.value = [];
+    appendLog({ time: now(), level: "ERROR", message: `查询运单失败: ${e}` });
+  } finally {
+    busy.value = false;
+  }
+}
+
+async function runSelectModify() {
+  if (!deliveryId.value.trim()) {
+    appendLog({ time: now(), level: "WARN", message: "请先输入 Delivery ID" });
+    return;
+  }
+  if (deliveryRows.value.length === 0) {
+    appendLog({ time: now(), level: "WARN", message: "请先点击“查询运单”获取物料列表" });
+    return;
+  }
+  if (!deliveryRows.value.some((r) => r.execute)) {
+    appendLog({ time: now(), level: "WARN", message: "请至少勾选一行“执行”" });
+    return;
+  }
+  busy.value = true;
+  try {
+    // 只处理勾选的物料行，语言取该行第2列的当前值（ZH/EN）
+    for (let k = 0; k < deliveryRows.value.length; k++) {
+      const row = deliveryRows.value[k];
+      if (!row.execute) continue;
+      row.result = "执行中...";
+      await yieldPaint();
+      try {
+        row.result = await invoke<string>("modify_delivery", {
+          orderNo: deliveryId.value.trim(),
+          isCreate: false,
+          lang: row.lang,
+          isSave: autoSave.value,
+          rowIndex: k,
+          connIdx: currentSession().connIdx,
+          sessIdx: currentSession().sessIdx,
+        });
+      } catch (e) {
+        row.result = `错误: ${e}`;
+      }
+      await yieldPaint();
+    }
+  } finally {
+    busy.value = false;
+  }
+}
+
+async function runModifyAll() {
+  if (!deliveryId.value.trim()) {
+    appendLog({ time: now(), level: "WARN", message: "请先输入 Delivery ID" });
+    return;
+  }
+  if (deliveryRows.value.length === 0) {
+    appendLog({ time: now(), level: "WARN", message: "请先点击“查询运单”获取物料列表" });
+    return;
+  }
+  busy.value = true;
+  try {
+    // 忽略“执行”勾选，逐行处理全部物料；首行 isCreate=true，其后 false；语言一律 ZH
+    let isCreate = true;
+    for (let k = 0; k < deliveryRows.value.length; k++) {
+      const row = deliveryRows.value[k];
+      row.lang = "ZH"; // 该行一律更新为 ZH
+      row.execute = true; // 该行一律更新为选中
+      row.result = "执行中...";
+      await yieldPaint();
+      try {
+        row.result = await invoke<string>("modify_delivery", {
+          orderNo: deliveryId.value.trim(),
+          isCreate,
+          lang: "ZH",
+          isSave: autoSave.value,
+          rowIndex: k,
+          connIdx: currentSession().connIdx,
+          sessIdx: currentSession().sessIdx,
+        });
+      } catch (e) {
+        row.result = `错误: ${e}`;
+      }
+      isCreate = false;
+      await yieldPaint();
+    }
   } finally {
     busy.value = false;
   }
@@ -506,28 +594,69 @@ onMounted(async () => {
         <!-- 修改交货单 -->
         <div class="card">
           <div class="card-title">修改交货单 (VL02N)</div>
-          <div class="card-body">
-            <div class="input-col">
-              <div class="label-row">
-                <label>Delivery ID</label>
-                <label class="checkbox">
-                  <input type="checkbox" v-model="autoSave" />
-                  自动保存
-                </label>
-              </div>
+          <div class="card-body delivery-body">
+            <div class="input-col delivery-input-col">
+              <label>Delivery ID</label>
               <input
                 v-model="deliveryId"
                 placeholder="例如 40844941"
                 @input="filterDigitsDelivery"
-                @keyup.enter="runDelivery"
+                @keyup.enter="runQueryDelivery"
               />
+              <label class="checkbox">
+                <input type="checkbox" v-model="autoSave" />
+                自动保存
+              </label>
             </div>
-            <div class="btn-col">
-              <button class="btn primary" :disabled="busy" @click="runDelivery">修改交货单</button>
+            <div class="btn-col delivery-btn-col">
+              <button class="btn primary" :disabled="busy" @click="runQueryDelivery">查询运单</button>
+              <button class="btn primary" :disabled="busy" @click="runSelectModify">选择修改</button>
+              <button class="btn primary" :disabled="busy" @click="runModifyAll">修改运单</button>
             </div>
-            <div class="result-box">
-              <div class="result-title">执行结果</div>
-              <pre class="result-text">{{ deliveryResult }}</pre>
+            <div class="table-col delivery-table-col">
+              <table class="data-table delivery-table">
+                <colgroup>
+                  <col class="c-material" />
+                  <col class="c-lang" />
+                  <col class="c-desc" />
+                  <col class="c-exec" />
+                  <col class="c-result" />
+                </colgroup>
+                <thead>
+                  <tr>
+                    <th>料号</th>
+                    <th>语言</th>
+                    <th>描述</th>
+                    <th>执行</th>
+                    <th>结果</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="(row, i) in deliveryRows" :key="i">
+                    <td class="col-material">{{ row.material }}</td>
+                    <td class="col-lang">
+                      <div
+                        class="lang-switch"
+                        :class="row.lang === 'EN' ? 'en' : 'zh'"
+                        :title="'当前语言: ' + row.lang"
+                        @click="row.lang = row.lang === 'EN' ? 'ZH' : 'EN'"
+                      >
+                        <span class="ls-label">ZH</span>
+                        <span class="ls-track"><span class="ls-knob"></span></span>
+                        <span class="ls-label">EN</span>
+                      </div>
+                    </td>
+                    <td class="col-desc">{{ row.description }}</td>
+                    <td class="col-exec">
+                      <input type="checkbox" v-model="row.execute" />
+                    </td>
+                    <td class="col-result">{{ row.result || "—" }}</td>
+                  </tr>
+                  <tr v-if="deliveryRows.length === 0" class="placeholder-row">
+                    <td colspan="5" class="empty">（未查询）</td>
+                  </tr>
+                </tbody>
+              </table>
             </div>
           </div>
         </div>
@@ -953,34 +1082,6 @@ body {
   vertical-align: middle;
 }
 
-/* ===== 交货单结果 ===== */
-.result-box {
-  flex: 1;
-  min-width: 368px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  overflow: hidden;
-  align-self: stretch;
-}
-
-.result-title {
-  font-weight: 600;
-  padding: 6px 12px;
-  background: linear-gradient(180deg, #f8fafd 0%, #eef2f8 100%);
-  border-bottom: 1px solid var(--border);
-  font-size: 12px;
-  color: #475569;
-}
-
-.result-text {
-  padding: 10px 12px;
-  white-space: pre-wrap;
-  word-break: break-all;
-  font-family: inherit;
-  font-size: 13px;
-  min-height: 56px;
-}
-
 /* ===== 右侧日志面板 ===== */
 /* 水平放大时优先撑宽日志；缩小到归零后主界面才开始收缩 */
 .log-panel {
@@ -1047,5 +1148,105 @@ body {
   color: #9aa2ab;
   text-align: center;
   padding: 20px;
+}
+
+/* ===== 交货单：查询运单 / 选择修改 / 修改运单 ===== */
+/* Delivery ID 输入框缩到原来一半（原 180px） */
+.input-col.delivery-input-col {
+  width: 100px;
+}
+
+/* 3 个按钮列收窄 */
+.btn-col.delivery-btn-col {
+  width: 92px;
+}
+
+.delivery-btn-col .btn.primary {
+  height: 32px;
+  font-size: 12px;
+  padding: 4px 8px;
+}
+
+/* 最右侧表格尽量宽：占满剩余空间，超高时纵向滚动 */
+.delivery-table-col {
+  min-width: 0;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.delivery-table {
+  table-layout: fixed;
+  height: auto;
+}
+
+.delivery-table th,
+.delivery-table td {
+  padding: 6px 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 列宽：料号可显示 8 位数字、语言滑动块、执行最窄、描述占满剩余（最宽）、结果约 3 个汉字宽 */
+.delivery-table .c-material { width: 92px; }
+.delivery-table .c-lang { width: 78px; }
+.delivery-table .c-exec { width: 36px; }
+.delivery-table .c-result { width: 66px; }
+
+.delivery-table .col-lang,
+.delivery-table .col-exec {
+  text-align: center;
+}
+
+.delivery-table .col-exec input {
+  accent-color: var(--primary);
+  cursor: pointer;
+  vertical-align: middle;
+}
+
+/* 语言滑动开关：左 ZH、右 EN */
+.lang-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  user-select: none;
+}
+.lang-switch .ls-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  line-height: 1;
+  transition: color 0.2s ease;
+}
+.lang-switch .ls-track {
+  position: relative;
+  width: 34px;
+  height: 18px;
+  border-radius: 999px;
+  background: #d6dbe3;
+  transition: background 0.2s ease;
+  flex-shrink: 0;
+}
+.lang-switch .ls-knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.35);
+  transition: left 0.2s ease;
+}
+.lang-switch.en .ls-track {
+  background: var(--primary);
+}
+.lang-switch.en .ls-knob {
+  left: 18px;
+}
+.lang-switch.zh .ls-label:first-child,
+.lang-switch.en .ls-label:last-child {
+  color: var(--primary);
 }
 </style>
