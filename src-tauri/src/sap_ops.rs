@@ -20,6 +20,31 @@ pub struct CreditInfo {
     pub available_delivery: f64,
 }
 
+// ---------- 常用元素 ID ----------
+/// FD33 信用总额（客户不存在时读不到）
+const CLALL_ID: &str = "wnd[0]/usr/tabsTABSTRIP_SEGMENTS/tabpTAB_1/ssub%_SUBSCREEN_SEGMENTS:ZF_FSCM_FD33_INFO_SHOW:1001/txtP_CLALL";
+/// VA03 抬头"条件"按钮（非抬头净值模式下先探测它）
+const BT_HEAD_ID: &str = "wnd[0]/usr/subSUBSCREEN_HEADER:SAPMV45A:4021/btnBT_HEAD";
+/// SAP 状态栏
+const SBAR_ID: &str = "wnd[0]/sbar";
+/// SAP 信息弹窗文本
+const MSG_TXT_ID: &str = "wnd[1]/usr/txtMESSTXT1";
+
+/// 读取状态栏/弹窗提示（读不到就返回空串，不抛错）
+fn read_status_text(session: &Session, id: &str) -> String {
+    session.get_text(id).unwrap_or_default().trim().to_string()
+}
+
+/// 将 SAP 返回的日期 YYYY-MM-DD 与时间 HH:MM:SS 合并为 "YYYY-MM-DD HH:MM:SS"
+/// （SAP 已是带分隔符格式，直接拼接；时间为空时仅返回日期）
+fn fmt_sap_datetime(date: &str, time: &str) -> String {
+    if time.is_empty() {
+        date.to_string()
+    } else {
+        format!("{date} {time}")
+    }
+}
+
 /// ① 客户信用信息查询 (FD33)
 pub fn get_customer_credit_info(
     app: &AppHandle,
@@ -27,6 +52,9 @@ pub fn get_customer_credit_info(
     customer_code: &str,
 ) -> Result<CreditInfo, String> {
     logger::info(app, &format!("FD33 查询客户信用: {customer_code} ..."));
+    if customer_code.trim().is_empty() {
+        return Err("客户编码为空".to_string());
+    }
     session.maximize()?;
     session.start_transaction("FD33")?;
     wait_sap(session, 5.0)?;
@@ -34,9 +62,23 @@ pub fn get_customer_credit_info(
     session.send_vkey(0)?;
     wait_sap(session, 5.0)?;
 
-    let total_credit_limit = parse_amount(&session.get_text(
-        "wnd[0]/usr/tabsTABSTRIP_SEGMENTS/tabpTAB_1/ssub%_SUBSCREEN_SEGMENTS:ZF_FSCM_FD33_INFO_SHOW:1001/txtP_CLALL",
-    )?);
+    // 防护：客户编码非法（不存在/未被维护）时信用字段读不到，SAP 会弹窗提示
+    let clall = match session.get_text(CLALL_ID) {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = read_status_text(session, MSG_TXT_ID);
+            let low = msg.to_lowercase();
+            let _ = session.send_vkey(0); // 关掉信息弹窗（若有）
+            let _ = session.send_vkey(3); // BACK 退出 FD33（与 Python 一致）
+            if low.contains("no customer") || low.contains("not in") {
+                logger::warn(app, &format!("FD33 客户 {customer_code} 不存在: {msg}"));
+                return Err(format!("客户 {customer_code} 不存在"));
+            }
+            logger::error(app, &format!("FD33 读取信用总额失败: {e}；提示: {msg}"));
+            return Err(format!("读取信用数据失败: {e}"));
+        }
+    };
+    let total_credit_limit = parse_amount(&clall);
     let open_orders = parse_amount(&session.get_text(
         "wnd[0]/usr/tabsTABSTRIP_SEGMENTS/tabpTAB_1/ssub%_SUBSCREEN_SEGMENTS:ZF_FSCM_FD33_INFO_SHOW:1001/txtP_OBORH",
     )?);
@@ -73,7 +115,10 @@ pub fn get_order_amount(
     only_head: bool,
     is_last: bool,
 ) -> Result<f64, String> {
-    logger::info(app, &format!("VA03 查询订单金额: {order_no} (is_last={is_last}) ..."));
+    logger::info(app, &format!("VA03 查询订单金额: {order_no}"));
+    if order_no.trim().is_empty() {
+        return Err("订单号为空".to_string());
+    }
     session.maximize()?;
     session.start_transaction("VA03")?;
     wait_sap(session, 5.0)?;
@@ -83,14 +128,20 @@ pub fn get_order_amount(
     session.send_vkey(0)?;
     wait_sap(session, 5.0)?;
 
-    let amount: f64;
-    if only_head {
-        amount = parse_amount(&session.get_text(
-            "wnd[0]/usr/subSUBSCREEN_HEADER:SAPMV45A:4021/txtVBAK-NETWR",
-        )?);
-    } else {
-        amount = read_price_total(session)?;
-    }
+    // 防护：订单号非法时目标字段不存在，SAP 会在状态栏提示
+    let amount: f64 = match ensure_order_readable(app, session, order_no, only_head) {
+        Ok(()) => {
+            if only_head {
+                parse_amount(&session.get_text(NETWR_ID)?)
+            } else {
+                read_price_total(app, session)?
+            }
+        }
+        Err(e) => {
+            let _ = session.send_vkey(3); // 尝试退出当前界面
+            return Err(e);
+        }
+    };
 
     logger::info(app, &format!("订单 {order_no} 金额: {amount}"));
 
@@ -106,8 +157,37 @@ pub fn get_order_amount(
     Ok(amount)
 }
 
-/// 打开定价页签并读取 "Total amount" 行的条件值（读到后按一次 BACK 退出页签）
-fn read_price_total(session: &Session) -> Result<f64, String> {
+/// 探测 VA03 当前界面是否能读到金额字段。
+/// 订单号非法（不存在/已归档）时字段不存在，SAP 会在状态栏给出提示，这里转成可读的错误。
+fn ensure_order_readable(
+    app: &AppHandle,
+    session: &Session,
+    order_no: &str,
+    only_head: bool,
+) -> Result<(), String> {
+    let probe_id = if only_head { NETWR_ID } else { BT_HEAD_ID };
+    if session.find_by_id(probe_id).is_ok() {
+        return Ok(());
+    }
+
+    let status = read_status_text(session, SBAR_ID);
+    let low = status.to_lowercase();
+    // 与 Python GetOrderAmount 一致：状态栏含 "not in" 即视为订单不存在/已归档
+    if low.contains("not in") {
+        logger::warn(app, &format!("订单 {order_no} 不存在或已归档（状态栏: {status}）"));
+        return Err(format!("订单 {order_no} 不存在或已归档"));
+    }
+    logger::error(app, &format!("订单 {order_no} 界面读取失败（状态栏: {status}）"));
+    Err(format!(
+        "界面读取失败（状态栏: {}）",
+        if status.is_empty() { "无提示" } else { &status }
+    ))
+}
+
+/// 打开定价页签并读取 "Total amount CRM" 行的条件值（读到后按一次 BACK 退出页签）
+/// 行定位逻辑与 Python GetOrderAmount / GetOrderAmounts 的定价分支完全一致：
+/// 用相对行号 row 计数（滚动后归零），命中即停；未命中时退回最后一行兜底。
+fn read_price_total(app: &AppHandle, session: &Session) -> Result<f64, String> {
     session
         .find_by_id("wnd[0]/usr/subSUBSCREEN_HEADER:SAPMV45A:4021/btnBT_HEAD")?
         .call("press", vec![])?;
@@ -116,9 +196,7 @@ fn read_price_total(session: &Session) -> Result<f64, String> {
         .find_by_id(r"wnd[0]/usr/tabsTAXI_TABSTRIP_HEAD/tabpT\05")?
         .call("select", vec![])?;
 
-    let price_table = session.find_by_id(
-        r"wnd[0]/usr/tabsTAXI_TABSTRIP_HEAD/tabpT\05/ssubSUBSCREEN_BODY:SAPLV69A:6201/tblSAPLV69ATCTRL_KONDITIONEN",
-    )?;
+    let mut price_table = session.find_by_id(PRICE_TABLE_ID)?;
 
     let columns = price_table.get_disp("Columns")?;
     let col_count = collection_count(&columns);
@@ -135,15 +213,60 @@ fn read_price_total(session: &Session) -> Result<f64, String> {
         }
     }
 
-    let rows = price_table.get_disp("Rows")?;
-    let row_count = collection_count(&rows);
+    // 在定价网格中定位 "Total amount CRM" 行（与 Python GetOrderAmount / GetOrderAmounts 完全对齐）。
+    // 网格行数可能超过视口：每轮先判断是否需要滚动，把目标行滚进可见区后再读。
+    // 滚动后按滚动条实际 position 计算相对行（正常不夹紧时为 0），夹紧时自动修正并记警告。
+    let max_row = price_table.get_i32("RowCount").unwrap_or(0);
+    let mut visible_row = price_table
+        .get_i32("VisibleRowCount")
+        .unwrap_or(max_row.max(1));
     let mut row: i32 = 0;
-    for i in 0..row_count {
-        let desc = get_cell_text(&price_table, i, desc_col)?;
-        if desc.contains("Total amount") {
-            row = i;
-            break;
+    let mut found = false;
+    for idx in 0..max_row {
+        // 先判断是否需要滚动，再读当前行（与 Python GetOrderAmount / GetOrderAmounts 一致）：
+        // idx >= visible_row 时滚到 idx-1，滚动后 row 归零，读到的即为下一个绝对行。
+        if idx >= visible_row {
+            let scrollbar = price_table.get_disp("verticalScrollbar")?;
+            scrollbar.set("position", i32_variant(idx - 1))?;
+            wait_sap(session, 5.0)?;
+            price_table = session.find_by_id(PRICE_TABLE_ID)?;
+            visible_row += price_table.get_i32("VisibleRowCount").unwrap_or(0);
+            // 回读滚动条实际位置（对应 Python 的 "Scroll to ... fail" 分支）：
+            // 控件可能把 position 夹紧到可停上限，此时 row=0 与期望绝对行错位，
+            // 用实际 pos 反算相对行，避免漏读或重复读某一行。
+            let actual_pos = price_table
+                .get_disp("verticalScrollbar")
+                .and_then(|sb| sb.get_i32("position"))
+                .unwrap_or(-1);
+            if actual_pos != idx - 1 {
+                logger::warn(
+                    app,
+                    &format!(
+                        "滚动到 {} 失败，当前滚动条位置: {}（按实际位置修正相对行）",
+                        idx - 1,
+                        actual_pos
+                    ),
+                );
+                row = idx - (actual_pos + 1);
+            } else {
+                row = 0;
+            }
         }
+        let desc = get_cell_text(&price_table, row, desc_col)?;
+        if desc.contains("Total amount CRM") {
+            found = true;
+            break;
+        } else {
+            row += 1;
+        }
+    }
+    // 行号命中保护：未找到 "Total amount CRM" 时退回最后一行兜底（与 Python isfound 标志一致）
+    if !found {
+        row -= 1;
+        logger::warn(
+            app,
+            &format!("未在 {max_row} 行内找到 Total amount CRM，改用最后一行 {row}"),
+        );
     }
 
     let amount = parse_amount(&get_cell_text(&price_table, row, col)?);
@@ -155,6 +278,9 @@ fn read_price_total(session: &Session) -> Result<f64, String> {
 const ORDER_ENTRY_ID: &str = "wnd[0]/usr/ctxtVBAK-VBELN";
 /// VA03 抬头净值字段
 const NETWR_ID: &str = "wnd[0]/usr/subSUBSCREEN_HEADER:SAPMV45A:4021/txtVBAK-NETWR";
+/// VA03 定价页签金额表格 (SAPLV69A Grid)
+const PRICE_TABLE_ID: &str =
+    r"wnd[0]/usr/tabsTAXI_TABSTRIP_HEAD/tabpT\05/ssubSUBSCREEN_BODY:SAPLV69A:6201/tblSAPLV69ATCTRL_KONDITIONEN";
 
 /// 确认已经回到 VA03 初始输入界面（找不到订单号输入框就再按 BACK，最多重试 3 次）
 fn back_to_order_entry(app: &AppHandle, session: &Session) -> Result<(), String> {
@@ -218,6 +344,9 @@ pub fn get_order_amounts(
         }
 
         let one = || -> Result<f64, String> {
+            if order_no.trim().is_empty() {
+                return Err("订单号为空".to_string());
+            }
             session
                 .set_text(ORDER_ENTRY_ID, order_no)
                 .map_err(|e| format!("设置订单号失败: {e}"))?;
@@ -229,13 +358,14 @@ pub fn get_order_amounts(
                 .send_vkey(0)
                 .map_err(|e| format!("第二次回车失败: {e}"))?;
             wait_sap(session, 5.0)?;
+            ensure_order_readable(app, session, order_no, only_head)?;
             if only_head {
                 let text = session
                     .get_text(NETWR_ID)
                     .map_err(|e| format!("读取抬头净值失败: {e}"))?;
                 Ok(parse_amount(&text))
             } else {
-                read_price_total(session).map_err(|e| format!("读取定价合计失败: {e}"))
+                read_price_total(app, session).map_err(|e| format!("读取定价合计失败: {e}"))
             }
         };
 
@@ -302,6 +432,9 @@ pub fn change_out_bound_delivery(
     is_save: bool,
 ) -> Result<Vec<String>, String> {
     logger::info(app, &format!("VL02N 修改外向交货单输出 ZPZ3: {order_no} (isSave={is_save}) ..."));
+    if order_no.trim().is_empty() {
+        return Ok(vec!["交货单号为空".to_string()]);
+    }
     session.maximize()?;
     session.start_transaction("VL02N")?;
     wait_sap(session, 5.0)?;
@@ -313,22 +446,75 @@ pub fn change_out_bound_delivery(
     let output_table_id = r"wnd[0]/usr/tblSAPDV70ATC_NAST3";
 
     let mut output_info: Vec<String> = Vec::new();
-    let mut delivery_table = session.find_by_id(delivery_table_id)?;
+    // 防护：交货单号非法（不存在）时明细表格读不到，SAP 会在状态栏提示
+    let mut delivery_table = match session.find_by_id(delivery_table_id) {
+        Ok(t) => t,
+        Err(e) => {
+            let status = read_status_text(session, SBAR_ID);
+            let low = status.to_lowercase();
+            let _ = session.send_vkey(3); // BACK 退出 VL02N（与 Python 一致）
+            // 与 Python ChangeOutBoundDelivery 一致：状态栏含 "not exist" 即视为交货单不存在
+            if low.contains("not exist") {
+                let msg = format!("{order_no} 不存在");
+                logger::warn(app, &format!("VL02N {msg}（状态栏: {status}）"));
+                return Ok(vec![msg]);
+            }
+            let msg = format!("{order_no} 获取表异常");
+            logger::error(app, &format!("VL02N 读取交货单表格失败: {e}；状态栏: {status}"));
+            return Ok(vec![msg]);
+        }
+    };
 
-    let rows = delivery_table.get_disp("Rows")?;
-    let row_count = collection_count(&rows);
+    let max_row = delivery_table.get_i32("RowCount").unwrap_or(0);
+    let mut visible_row = delivery_table
+        .get_i32("VisibleRowCount")
+        .unwrap_or(max_row.max(1));
+    let mut row: i32 = 0;
 
-    for i in 0..row_count {
+    for i in 0..max_row {
         // 每次迭代重新获取表格：上一轮末尾的 BACK / press / select 会重建界面，
         // 旧的 COM 引用会失效，再调用其 GetCell 会返回 E_NOTIMPL(0x80004001)。
         // test.py 也在每次循环末尾重新 findById(deliveryTableId)。
         delivery_table = session.find_by_id(delivery_table_id)?;
 
-        let material = get_cell_text(&delivery_table, i, 1)?;
+        // 先判断是否需要滚动（与 Python 一致：i >= visualRow 时滚到 i-1），
+        // 再用滚动条实际 position 计算本行在视口中的相对位置（不夹紧时为 0）。
+        if i >= visible_row {
+            let scrollbar = delivery_table.get_disp("verticalScrollbar")?;
+            scrollbar.set("position", i32_variant(i - 1))?;
+            wait_sap(session, 5.0)?;
+            delivery_table = session.find_by_id(delivery_table_id)?;
+            visible_row += delivery_table.get_i32("VisibleRowCount").unwrap_or(0);
+            // 回读实际位置（对应 Python 的 "Scroll to ... fail" 分支）：
+            // 被夹紧时 row=0 会与期望绝对行错位（某行重复处理、另一行漏处理），
+            // 用实际 pos 反算相对行。
+            let actual_pos = delivery_table
+                .get_disp("verticalScrollbar")
+                .and_then(|sb| sb.get_i32("position"))
+                .unwrap_or(-1);
+            if actual_pos != i - 1 {
+                logger::warn(
+                    app,
+                    &format!(
+                        "滚动到 {} 失败，当前滚动条位置: {}（按实际位置修正相对行）",
+                        i - 1,
+                        actual_pos
+                    ),
+                );
+                row = i - (actual_pos + 1);
+            } else {
+                row = 0;
+            }
+        }
+
+        // 读取当前可见行；下面 select 用的是同一个 row（修复旧版"读 N 行、选 N+1 行"的错位）
+        let material = get_cell_text(&delivery_table, row, 1)?;
         if material.is_empty() {
+            logger::info(app, "All order set output");
             break;
         }
-        select_row(&delivery_table, i)?;
+        select_row(&delivery_table, row)?;
+        row += 1; // 选中后再前进到下一行
 
         // 菜单：输出
         session
@@ -338,7 +524,7 @@ pub fn change_out_bound_delivery(
 
         let mut output_table = session.find_by_id(output_table_id)?;
 
-        let mut zpz3_list: Vec<(String, String)> = Vec::new();
+        let mut zpz3_list: Vec<(String, String, String)> = Vec::new();
         let mut end_row: i32 = 0;
         let mut need_create = true;
 
@@ -351,9 +537,10 @@ pub fn change_out_bound_delivery(
             let status = get_cell_icon(&output_table, j, 0)?;
             let out_type = get_cell_text(&output_table, j, 1)?;
             let proce_date = get_cell_text(&output_table, j, 8)?;
+            let proce_time = get_cell_text(&output_table, j, 9)?;
 
             if out_type == "ZPZ3" {
-                zpz3_list.push((status.clone(), proce_date.clone()));
+                zpz3_list.push((status.clone(), proce_date.clone(), proce_time.clone()));
             }
             if out_type == "ZPZ3" && status == "S_TL_Y" {
                 logger::info(app, &format!("找到需修改的 ZPZ3，行: {j}"));
@@ -390,20 +577,20 @@ pub fn change_out_bound_delivery(
         logger::info(app, &format!("ZPZ3 列表: {:?}", zpz3_list));
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         let today_date = chrono::Local::now().date_naive();
-        let mut existing_date: Option<String> = None; // 保存已存在的 ZPZ3 日期，供后续日志打印
-        for (status, pro_data) in &zpz3_list {
-            // 3 天内（含今天；过去/未来都算）已处理的 ZPZ3 视为无需新增
-            let within_days = match chrono::NaiveDate::parse_from_str(pro_data, "%Y-%m-%d") {
+        let mut existing_time: Option<String> = None; // 保存已存在 ZPZ3 的完整时间(YYYY-MM-DD HH:MM:SS)，供日志打印
+        for (status, pro_date, pro_time) in &zpz3_list {
+            let within_days = match chrono::NaiveDate::parse_from_str(pro_date, "%Y-%m-%d") {
                 Ok(d) => (today_date - d).num_days().abs() <= 3,
                 Err(_) => {
-                    logger::warn(app, &format!("{material} ZPZ3 处理日期无法解析: {pro_data}"));
+                    logger::warn(app, &format!("{material} ZPZ3 处理日期无法解析: {pro_date}"));
                     false
                 }
             };
             if status == "S_TL_G" && within_days {
                 need_create = false;
-                existing_date = Some(pro_data.clone());
-                logger::info(app, &format!("{material} 3天内已设置 ZPZ3，日期: {pro_data}"));
+                let combined = fmt_sap_datetime(pro_date, pro_time);
+                existing_time = Some(combined.clone());
+                logger::info(app, &format!("{material} 3天内已设置 ZPZ3，时间: {combined}"));
                 break;
             }
         }
@@ -443,9 +630,9 @@ pub fn change_out_bound_delivery(
                 break;
             }
         } else {
-            let date_hint = existing_date
+            let date_hint = existing_time
                 .as_deref()
-                .map(|d| format!("，日期：{d}"))
+                .map(|d| format!("，时间：{d}"))
                 .unwrap_or_default();
             logger::info(app, &format!("{material} 无需新增 ZPZ3 {date_hint}"));
         }
